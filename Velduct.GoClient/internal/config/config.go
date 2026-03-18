@@ -23,10 +23,12 @@ type Config struct {
 	CreditTimeoutSec       int `json:"credit_timeout_sec"`
 	SingleUploadTimeoutSec int `json:"single_upload_timeout_sec"`
 
-	ScanBatchSize      int `json:"scan_batch_size"`
-	UploadQueueSize    int `json:"upload_queue_size"`
-	DebounceDurationMs int `json:"debounce_duration_ms"`
-	StartupSyncDelayMs int `json:"startup_sync_delay_ms"`
+	ScanBatchSize          int `json:"scan_batch_size"`
+	UploadQueueSize        int `json:"upload_queue_size"`
+	DebounceDurationMs     int `json:"debounce_duration_ms"`
+	StartupSyncDelayMs     int `json:"startup_sync_delay_ms"`
+	BatchCoalescingMaxMs   int `json:"batch_coalescing_max_ms"`
+	BatchCoalescingIdleMs  int `json:"batch_coalescing_idle_ms"`
 
 	MaxCopyRetries       int `json:"max_copy_retries"`
 	FileLockRetryDelayMs int `json:"file_lock_retry_delay_ms"`
@@ -39,4 +41,7 @@ type Config struct {
 	JwtIssuer     string `json:"jwt_issuer"`
 	JwtAudience   string `json:"jwt_audience"`
 	JwtTTLSeconds int    `json:"jwt_ttl_seconds"`
+
+	// Detected at startup; not from config file
+	FsPrecisionMs int64 `json:"-"`
 }

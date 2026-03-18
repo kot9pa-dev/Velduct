@@ -50,7 +50,17 @@ public sealed class SingleFileReceiver : IAsyncDisposable
             LastWriteTimeUtc = DateTimeOffset.FromUnixTimeMilliseconds(mtimeMs).UtcDateTime
         };
 
-        _finalPath = Path.Combine(_options.Storage.DataDirectory, key, _currentFile.RelativePath);
+        // Path traversal protection
+        string shareRoot = Path.GetFullPath(Path.Combine(_options.Storage.DataDirectory, key));
+        _finalPath = Path.GetFullPath(Path.Combine(shareRoot, _currentFile.RelativePath));
+        if (!_finalPath.StartsWith(shareRoot + Path.DirectorySeparatorChar) && _finalPath != shareRoot)
+        {
+            _logger.LogWarning("Path traversal blocked in file offer: {Key}/{RelPath} resolved to {Path}",
+                key, _currentFile.RelativePath, _finalPath);
+            _currentFile = null;
+            _finalPath = null;
+            return;
+        }
 
         int lastSlash = _currentFile.RelativePath.LastIndexOf('/');
         string dirPath = lastSlash >= 0 ? _currentFile.RelativePath.Substring(0, lastSlash) : "";

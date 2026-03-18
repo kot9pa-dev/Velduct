@@ -5,8 +5,11 @@ import (
 	"flag"
 	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"net/http"
@@ -15,6 +18,7 @@ import (
 	"Velduct.GoClient/internal/client"
 	"Velduct.GoClient/internal/config"
 	"Velduct.GoClient/internal/constants"
+	"Velduct.GoClient/internal/fsinfo"
 	"Velduct.GoClient/internal/transfer"
 	"Velduct.GoClient/internal/watcher"
 )
@@ -67,6 +71,8 @@ func loadConfig() config.Config {
 		UploadQueueSize:        500,
 		DebounceDurationMs:     2500,
 		StartupSyncDelayMs:     500,
+		BatchCoalescingMaxMs:   2500,
+		BatchCoalescingIdleMs:  250,
 		MaxCopyRetries:         10,
 		FileLockRetryDelayMs:   500,
 		WatcherEventBufferSize: 512,
@@ -101,6 +107,8 @@ func loadConfig() config.Config {
 	cfg.UploadQueueSize        = envInt(constants.EnvUploadQueueSize, cfg.UploadQueueSize)
 	cfg.DebounceDurationMs     = envInt(constants.EnvDebounceDurationMs, cfg.DebounceDurationMs)
 	cfg.StartupSyncDelayMs     = envInt(constants.EnvStartupSyncDelayMs, cfg.StartupSyncDelayMs)
+	cfg.BatchCoalescingMaxMs   = envInt(constants.EnvBatchCoalescingMaxMs, cfg.BatchCoalescingMaxMs)
+	cfg.BatchCoalescingIdleMs  = envInt(constants.EnvBatchCoalescingIdleMs, cfg.BatchCoalescingIdleMs)
 	cfg.MaxCopyRetries         = envInt(constants.EnvMaxCopyRetries, cfg.MaxCopyRetries)
 	cfg.FileLockRetryDelayMs   = envInt(constants.EnvFileLockRetryDelayMs, cfg.FileLockRetryDelayMs)
 	cfg.WatcherEventBufferSize = envInt(constants.EnvWatcherEventBufferSize, cfg.WatcherEventBufferSize)
@@ -204,6 +212,14 @@ func main() {
 	transfer.EnsureTempDirs(cfg.TempDirs)
 	transfer.CleanupTempFiles(cfg.TempDirs, cfg.Shares)
 
+	cfg.FsPrecisionMs = fsinfo.DetectWorstPrecisionMs(cfg.Shares)
+	slog.Info("FS mtime precision", "worstCaseMs", cfg.FsPrecisionMs)
+
+	// Graceful shutdown on SIGTERM/SIGINT
+	var shuttingDown atomic.Bool
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
 	var currentClient *client.Client
 
 	fileWatcher, err := watcher.NewWatcher(cfg.Shares, cfg.TempDirs, cfg.TargetShares, cfg.WatcherEventBufferSize, cfg.DebounceDurationMs, func(changes map[string][]string) {
@@ -220,7 +236,17 @@ func main() {
 		defer fileWatcher.Close()
 	}
 
-	for {
+	// Signal handler goroutine
+	go func() {
+		sig := <-sigCh
+		slog.Info("Received signal, shutting down gracefully...", "signal", sig)
+		shuttingDown.Store(true)
+		if currentClient != nil {
+			currentClient.Close()
+		}
+	}()
+
+	for !shuttingDown.Load() {
 		c := client.NewClient(cfg)
 		currentClient = c
 
@@ -228,13 +254,18 @@ func main() {
 		if err != nil {
 			slog.Error("Connection failed", "error", err, "retry_in", cfg.ReconnectIntervalSec)
 			currentClient = nil
+			if shuttingDown.Load() {
+				break
+			}
 			time.Sleep(time.Duration(cfg.ReconnectIntervalSec) * time.Second)
 			continue
 		}
 
 		go func() {
 			time.Sleep(time.Duration(cfg.StartupSyncDelayMs) * time.Millisecond)
-			c.SyncAllShares()
+			if !shuttingDown.Load() {
+				c.SyncAllShares()
+			}
 		}()
 
 		c.Run()
@@ -242,7 +273,13 @@ func main() {
 		currentClient = nil
 		c.Close()
 
+		if shuttingDown.Load() {
+			break
+		}
+
 		slog.Warn("Disconnected", "retry_in", cfg.ReconnectIntervalSec)
 		time.Sleep(time.Duration(cfg.ReconnectIntervalSec) * time.Second)
 	}
+
+	slog.Info("Client stopped.")
 }

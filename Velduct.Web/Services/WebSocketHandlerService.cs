@@ -174,14 +174,33 @@ public class WebSocketHandlerService : IFrameHandler
         }
 
         int count = BitConverter.ToInt32(payload, pos); pos += 4;
-        var files = new List<FileMetadata>(count);
+
+        // Bounds validation: reject absurdly large counts to prevent OOM/DoS.
+        // Each file entry is at least 24 bytes (4+1 + 4+1 + 8 + 8).
+        const int MinEntrySize = 24;
+        int maxPossible = (payload.Length - pos) / MinEntrySize;
+        if (count < 0 || count > maxPossible)
+        {
+            _logger.LogWarning("CMD_CHECK_FILES: invalid count {Count} (max possible {Max} for payload length {Len}), ignoring.",
+                count, maxPossible, payload.Length);
+            return;
+        }
+
+        var files = new List<FileMetadata>(Math.Min(count, 10000));
 
         for (int i = 0; i < count; i++)
         {
+            if (pos + 4 > payload.Length) break;
             int keyLen = BitConverter.ToInt32(payload, pos); pos += 4;
+            if (keyLen < 0 || pos + keyLen > payload.Length) break;
             string key = Encoding.UTF8.GetString(payload, pos, keyLen); pos += keyLen;
+
+            if (pos + 4 > payload.Length) break;
             int pathLen = BitConverter.ToInt32(payload, pos); pos += 4;
+            if (pathLen < 0 || pos + pathLen > payload.Length) break;
             string path = Encoding.UTF8.GetString(payload, pos, pathLen); pos += pathLen;
+
+            if (pos + 16 > payload.Length) break;
             long size = BitConverter.ToInt64(payload, pos); pos += 8;
             long mtimeMs = BitConverter.ToInt64(payload, pos); pos += 8;
 
@@ -208,13 +227,18 @@ public class WebSocketHandlerService : IFrameHandler
 
         int pos = 0;
         int count = BitConverter.ToInt32(payload, pos); pos += 4;
+        if (count < 0 || count > 1000)
+        {
+            _logger.LogWarning("CMD_REGISTER_SHARES: invalid count {Count}, ignoring.", count);
+            return;
+        }
         var keys = new List<string>(count);
 
         for (int i = 0; i < count; i++)
         {
             if (pos + 4 > payload.Length) break;
             int keyLen = BitConverter.ToInt32(payload, pos); pos += 4;
-            if (pos + keyLen > payload.Length) break;
+            if (keyLen < 0 || keyLen > 1024 || pos + keyLen > payload.Length) break;
             keys.Add(Encoding.UTF8.GetString(payload, pos, keyLen));
             pos += keyLen;
         }
@@ -266,18 +290,25 @@ public class WebSocketHandlerService : IFrameHandler
 
         int pos = 0;
         int count = BitConverter.ToInt32(payload, pos); pos += 4;
-        var files = new List<FileMetadata>(count);
+        const int MinEntrySize = 24;
+        int maxPossible = (payload.Length - pos) / MinEntrySize;
+        if (count < 0 || count > maxPossible)
+        {
+            _logger.LogWarning("CMD_BATCH_PULL: invalid count {Count}, ignoring.", count);
+            return;
+        }
+        var files = new List<FileMetadata>(Math.Min(count, 10000));
 
         for (int i = 0; i < count; i++)
         {
             if (pos + 4 > payload.Length) break;
             int keyLen = BitConverter.ToInt32(payload, pos); pos += 4;
-            if (pos + keyLen > payload.Length) break;
+            if (keyLen < 0 || pos + keyLen > payload.Length) break;
             string key = Encoding.UTF8.GetString(payload, pos, keyLen); pos += keyLen;
 
             if (pos + 4 > payload.Length) break;
             int pathLen = BitConverter.ToInt32(payload, pos); pos += 4;
-            if (pos + pathLen > payload.Length) break;
+            if (pathLen < 0 || pos + pathLen > payload.Length) break;
             string path = Encoding.UTF8.GetString(payload, pos, pathLen); pos += pathLen;
 
             if (pos + 16 > payload.Length) break;
@@ -307,9 +338,62 @@ public class WebSocketHandlerService : IFrameHandler
             await foreach (var firstBatch in _pullRequestChannel.Reader.ReadAllAsync(ct))
             {
                 var combined = new List<FileMetadata>(firstBatch);
-                while (_pullRequestChannel.Reader.TryRead(out var moreBatch))
+
+                // Coalescing: accumulate pull requests before creating a single TAR.
+                // Mirrors client-side batch worker policy (sender.go drainLoop):
+                //   - maxFiles  = ScanBatchSize * MaxCredits  (derived, same as client)
+                //   - maxBytes  = MaxCredits * ChunkSizeBytes (derived, same as client)
+                //   - idleGap   = PullCoalescingIdleMs        (config, default 250ms)
+                //   - totalCap  = PullCoalescingMaxMs         (config, default 2500ms)
+                int maxFiles = _options.Sync.ScanBatchSize * _options.Network.MaxCredits;
+                long maxBytes = (long)_options.Network.MaxCredits * _options.Network.ChunkSizeBytes;
+                long currentBytes = combined.Sum(f => f.Size);
+
+                var totalDeadline = DateTime.UtcNow.AddMilliseconds(_options.Sync.PullCoalescingMaxMs);
+                while (DateTime.UtcNow < totalDeadline
+                       && combined.Count < maxFiles
+                       && currentBytes < maxBytes)
                 {
-                    combined.AddRange(moreBatch);
+                    while (_pullRequestChannel.Reader.TryRead(out var moreBatch))
+                    {
+                        combined.AddRange(moreBatch);
+                        currentBytes += moreBatch.Sum(f => f.Size);
+                        if (combined.Count >= maxFiles || currentBytes >= maxBytes)
+                            break;
+                    }
+
+                    // Trim excess: TryRead adds whole batch, may overshoot maxFiles.
+                    // Return leftover to channel for next TAR.
+                    if (combined.Count > maxFiles)
+                    {
+                        var excess = combined.GetRange(maxFiles, combined.Count - maxFiles);
+                        combined.RemoveRange(maxFiles, combined.Count - maxFiles);
+                        currentBytes = combined.Sum(f => f.Size);
+                        _pullRequestChannel.Writer.TryWrite(excess);
+                    }
+
+                    if (combined.Count >= maxFiles || currentBytes >= maxBytes)
+                        break;
+
+                    var remaining = totalDeadline - DateTime.UtcNow;
+                    if (remaining <= TimeSpan.Zero)
+                        break;
+
+                    // Wait up to IdleMs for next item — if nothing arrives, we're done coalescing
+                    var idleTimeout = TimeSpan.FromMilliseconds(
+                        Math.Min(_options.Sync.PullCoalescingIdleMs, remaining.TotalMilliseconds));
+                    using var delayCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    delayCts.CancelAfter(idleTimeout);
+                    try
+                    {
+                        if (await _pullRequestChannel.Reader.WaitToReadAsync(delayCts.Token))
+                            continue;
+                        break;
+                    }
+                    catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                    {
+                        break; // Idle timeout — send what we have
+                    }
                 }
 
                 var deduped = combined

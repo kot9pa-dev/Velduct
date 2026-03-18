@@ -87,11 +87,15 @@ public sealed class DiskWorkerService
 
             if (moveSuccess)
             {
-                _storage.UpdateFileInCache(task.Key, task.RelativePath, task.Size, task.LastWriteTimeUtc);
+                // Read back actual mtime from disk (may differ due to FS precision rounding).
+                // This ensures cache, ACK, and broadcast all use the FS-normalized value.
+                var actualMtime = File.GetLastWriteTimeUtc(task.FinalPath);
+
+                _storage.UpdateFileInCache(task.Key, task.RelativePath, task.Size, actualMtime);
                 _logger.LogDebug("File written: {Key}/{RelPath} ({Size} bytes).",
                     task.Key, task.RelativePath, task.Size);
 
-                long serverMtimeMs = new DateTimeOffset(task.LastWriteTimeUtc).ToUnixTimeMilliseconds();
+                long serverMtimeMs = new DateTimeOffset(actualMtime).ToUnixTimeMilliseconds();
 
                 // Send server-authoritative mtime back to uploading client so it can
                 // align its local file timestamp with the server's single source of truth.
@@ -106,7 +110,7 @@ public sealed class DiskWorkerService
                     task.Key,
                     task.RelativePath,
                     task.Size,
-                    task.LastWriteTimeUtc));
+                    actualMtime));
             }
             else
             {
@@ -186,9 +190,12 @@ public sealed class DiskWorkerService
                 try
                 {
                     File.SetLastWriteTimeUtc(task.FinalPath, task.LastWriteTimeUtc);
-                    _storage.UpdateFileInCache(task.Key, task.RelativePath, task.Size, task.LastWriteTimeUtc);
 
-                    long serverMtimeMs = new DateTimeOffset(task.LastWriteTimeUtc).ToUnixTimeMilliseconds();
+                    // Read back actual mtime from disk (FS precision normalization)
+                    var actualMtime = File.GetLastWriteTimeUtc(task.FinalPath);
+                    _storage.UpdateFileInCache(task.Key, task.RelativePath, task.Size, actualMtime);
+
+                    long serverMtimeMs = new DateTimeOffset(actualMtime).ToUnixTimeMilliseconds();
 
                     // Send server-authoritative mtime back to uploading client
                     session.Connection.EnqueueSend(
@@ -202,7 +209,7 @@ public sealed class DiskWorkerService
                         task.Key,
                         task.RelativePath,
                         task.Size,
-                        task.LastWriteTimeUtc));
+                        actualMtime));
 
                     filesProcessed++;
                 }

@@ -18,23 +18,22 @@ type FileInfo struct {
 	MTimeMs int64
 }
 
-// mtimeEpsilonMs is the tolerance for mtime comparison (covers FAT32 2s rounding, HFS+ 1s).
-const mtimeEpsilonMs int64 = 2000
-
 // SyncHandler handles incoming CmdCheckFiles and determines which files to download or delete.
 type SyncHandler struct {
 	shares         map[string]string
 	sendFunc       func([]byte) error
 	cancelDownload func(string) bool
 	scanBatchSize  int
+	fsPrecisionMs  int64
 }
 
-func NewSyncHandler(shares map[string]string, sendFunc func([]byte) error, cancelDownload func(string) bool, scanBatchSize int) *SyncHandler {
+func NewSyncHandler(shares map[string]string, sendFunc func([]byte) error, cancelDownload func(string) bool, scanBatchSize int, fsPrecisionMs int64) *SyncHandler {
 	return &SyncHandler{
 		shares:         shares,
 		sendFunc:       sendFunc,
 		cancelDownload: cancelDownload,
 		scanBatchSize:  scanBatchSize,
+		fsPrecisionMs:  fsPrecisionMs,
 	}
 }
 
@@ -103,12 +102,16 @@ func (sh *SyncHandler) needsDownload(f FileInfo) bool {
 	localSize := info.Size()
 	localMtimeMs := info.ModTime().UnixNano() / 1e6
 
-	// Epsilon covers FS rounding (FAT32 → 2s, HFS+ → 1s).
-	diff := f.MTimeMs - localMtimeMs
-	if diff < 0 {
-		diff = -diff
+	if localSize != f.Size {
+		return true
 	}
-	if localSize == f.Size && diff <= mtimeEpsilonMs {
+
+	// Truncate both mtimes to detected FS precision before comparing.
+	// Handles FS rounding (FAT32→2s, HFS+→1s) without hardcoded epsilon.
+	localTrunc := truncateMs(localMtimeMs, sh.fsPrecisionMs)
+	serverTrunc := truncateMs(f.MTimeMs, sh.fsPrecisionMs)
+
+	if localTrunc == serverTrunc {
 		return false
 	}
 
@@ -244,6 +247,16 @@ func decodeCheckFilesPayload(payload []byte) []FileInfo {
 	}
 
 	return files
+}
+
+func truncateMs(ms, precisionMs int64) int64 {
+	if precisionMs <= 1 {
+		return ms
+	}
+	if ms >= 0 {
+		return (ms / precisionMs) * precisionMs
+	}
+	return ((ms - precisionMs + 1) / precisionMs) * precisionMs
 }
 
 // RegisterShares sends CMD_REGISTER_SHARES to server.

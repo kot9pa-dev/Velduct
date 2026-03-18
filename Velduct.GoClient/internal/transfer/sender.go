@@ -25,6 +25,11 @@ func newFileSender(s *Session) *fileSender {
 
 func (fs *fileSender) runSingleUploadWorker() {
 	defer fs.s.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("[Sender] Single upload worker panicked (fatal)", "recover", r)
+		}
+	}()
 	slog.Debug("[Sender] Single upload worker started")
 
 	for {
@@ -33,9 +38,16 @@ func (fs *fileSender) runSingleUploadWorker() {
 			slog.Debug("[Sender] Single upload worker stopped")
 			return
 		case task := <-fs.s.singleQueue:
-			fs.s.muTask.Lock()
-			fs.processSingleUpload(task)
-			fs.s.muTask.Unlock()
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("[Sender] Panic in single upload task", "key", task.key, "path", task.relPath, "recover", r)
+					}
+				}()
+				fs.s.muTask.Lock()
+				defer fs.s.muTask.Unlock()
+				fs.processSingleUpload(task)
+			}()
 		}
 	}
 }
@@ -100,10 +112,13 @@ func (fs *fileSender) uploadFile(path string) error {
 				slog.Debug("[Sender] Upload aborted by context cancellation", "path", path)
 				return io.ErrUnexpectedEOF
 			case <-time.After(time.Duration(fs.s.Config.SingleUploadTimeoutSec) * time.Second):
-				slog.Error("[Sender] Credit timeout — server not responding",
+				slog.Error("[Sender] Credit timeout — server not responding, cancelling session",
 					"path", path,
 					"timeout_sec", fs.s.Config.SingleUploadTimeoutSec,
 					"chunks_sent", chunksSent)
+				// Cancel session: further sends on this connection will also timeout.
+				// Client will reconnect and re-sync.
+				fs.s.cancel()
 				return io.ErrUnexpectedEOF
 			}
 
@@ -131,9 +146,17 @@ func (fs *fileSender) uploadFile(path string) error {
 
 func (fs *fileSender) runBatchWorker() {
 	defer fs.s.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("[Sender] Batch worker panicked (fatal)", "recover", r)
+		}
+	}()
 	slog.Debug("[Sender] Batch worker started")
 
-	maxArchiveSizeBytes := int64(fs.s.Config.MaxCredits) * int64(fs.s.Config.ChunkSizeBytes)
+	maxFiles := fs.s.Config.ScanBatchSize * fs.s.Config.MaxCredits
+	maxBytes := int64(fs.s.Config.MaxCredits) * int64(fs.s.Config.ChunkSizeBytes)
+	coalescingMax := time.Duration(fs.s.Config.BatchCoalescingMaxMs) * time.Millisecond
+	coalescingIdle := time.Duration(fs.s.Config.BatchCoalescingIdleMs) * time.Millisecond
 
 	for {
 		select {
@@ -143,32 +166,91 @@ func (fs *fileSender) runBatchWorker() {
 		case batch := <-fs.s.batchQueue:
 			currentSize := calcBatchSize(batch)
 
-		drainLoop:
-			for len(batch) < (fs.s.Config.ScanBatchSize*fs.s.Config.MaxCredits) && currentSize < maxArchiveSizeBytes {
+			// Coalescing: accumulate batches up to maxFiles/maxBytes or time limits.
+			// Mirrors server-side PullWorker policy.
+			deadline := time.Now().Add(coalescingMax)
+			for len(batch) < maxFiles && currentSize < maxBytes && time.Now().Before(deadline) {
+				// Drain everything already queued
+				drained := false
+				for {
+					select {
+					case more := <-fs.s.batchQueue:
+						batch = append(batch, more...)
+						currentSize += calcBatchSize(more)
+						drained = true
+					default:
+						drained = false
+					}
+					if !drained {
+						break
+					}
+					if len(batch) >= maxFiles || currentSize >= maxBytes {
+						break
+					}
+				}
+
+				// Trim excess: batch append may overshoot maxFiles.
+				// Return leftover to queue for next TAR.
+				if len(batch) > maxFiles {
+					excess := batch[maxFiles:]
+					batch = batch[:maxFiles]
+					currentSize = calcBatchSize(batch)
+					// Return excess non-blocking; queue is buffered
+					select {
+					case fs.s.batchQueue <- append([]ArchiveFile(nil), excess...):
+					default:
+						slog.Warn("[Sender] Could not return excess to queue", "excess", len(excess))
+					}
+				}
+
+				if len(batch) >= maxFiles || currentSize >= maxBytes {
+					break
+				}
+
+				// Idle wait: if nothing arrives within idleMs, flush
 				select {
 				case <-fs.s.ctx.Done():
 					return
 				case more := <-fs.s.batchQueue:
 					batch = append(batch, more...)
 					currentSize += calcBatchSize(more)
-					if currentSize >= maxArchiveSizeBytes || len(batch) >= (fs.s.Config.ScanBatchSize*fs.s.Config.MaxCredits) {
-						break drainLoop
-					}
-				default:
-					break drainLoop
+				case <-time.After(coalescingIdle):
+					// Idle gap expired — send what we have
+					goto sendBatch
 				}
 			}
 
-			fs.s.muTask.Lock()
-			slog.Debug("[Sender] Processing merged batch",
-				"total_files", len(batch),
-				"size_mb", currentSize/(1024*1024),
-				"remaining_in_queue", len(fs.s.batchQueue))
-
-			if err := fs.s.tar.SendFileList(fs.s.Shares, batch); err != nil {
-				slog.Error("[Sender] Batch TAR error", "err", err)
+			// Final trim (idle wait or last batch could overshoot)
+			if len(batch) > maxFiles {
+				excess := batch[maxFiles:]
+				batch = batch[:maxFiles]
+				currentSize = calcBatchSize(batch)
+				select {
+				case fs.s.batchQueue <- append([]ArchiveFile(nil), excess...):
+				default:
+					slog.Warn("[Sender] Could not return excess to queue", "excess", len(excess))
+				}
 			}
-			fs.s.muTask.Unlock()
+		sendBatch:
+
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("[Sender] Panic in batch TAR send", "recover", r, "files", len(batch))
+					}
+				}()
+				fs.s.muTask.Lock()
+				defer fs.s.muTask.Unlock()
+				slog.Debug("[Sender] Processing merged batch",
+					"total_files", len(batch),
+					"size_mb", currentSize/(1024*1024),
+					"remaining_in_queue", len(fs.s.batchQueue))
+
+				if err := fs.s.tar.SendFileList(fs.s.Shares, batch); err != nil {
+					slog.Error("[Sender] Batch TAR error, cancelling session", "err", err)
+					fs.s.cancel()
+				}
+			}()
 		}
 	}
 }

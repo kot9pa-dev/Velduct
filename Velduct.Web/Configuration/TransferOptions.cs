@@ -34,7 +34,7 @@ public class NetworkOptions
 
     public int MessagePayloadBufferSize { get; set; } = 256 * 1024;
 
-    public int SendChannelCapacity { get; set; } = 256;
+    public int SendChannelCapacity { get; set; } = 4096;
 
     public int CreditTimeoutSeconds { get; set; } = 60;
 
@@ -67,6 +67,18 @@ public class SyncOptions
     public int DeleteTimestampCleanupThreshold { get; set; } = 1000;
 
     public int DeleteTimestampTtlMinutes { get; set; } = 5;
+
+    /// <summary>
+    /// Max total time (ms) to wait for pull requests before sending a TAR to client.
+    /// Matches client-side debounce; higher = bigger TARs, fewer per-archive overheads.
+    /// </summary>
+    public int PullCoalescingMaxMs { get; set; } = 2500;
+
+    /// <summary>
+    /// Idle gap (ms): if no new pull requests arrive within this window, flush immediately.
+    /// Lower = more responsive for small syncs; higher = better batching for large syncs.
+    /// </summary>
+    public int PullCoalescingIdleMs { get; set; } = 250;
 }
 
 public class BroadcastOptions

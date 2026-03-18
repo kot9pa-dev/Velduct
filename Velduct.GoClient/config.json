@@ -18,6 +18,8 @@
   "upload_queue_size": 100,
   "debounce_duration_ms": 1000,
   "startup_sync_delay_ms": 200,
+  "batch_coalescing_max_ms": 2500,
+  "batch_coalescing_idle_ms": 250,
   "max_copy_retries": 5,
   "file_lock_retry_delay_ms": 250,
   "watcher_event_buffer_size": 256,

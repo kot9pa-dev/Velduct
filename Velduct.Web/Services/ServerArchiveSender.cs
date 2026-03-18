@@ -228,8 +228,20 @@ public sealed class ServerArchiveSender
                         }
                         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
                         {
-                            _logger.LogWarning("Credit timeout from client during server TAR send.");
+                            _logger.LogWarning("Credit timeout from client during server TAR send — closing connection.");
                             reader.AdvanceTo(buffer.Start);
+
+                            // Close WebSocket: client is unresponsive, further sends will also timeout.
+                            // Client will reconnect and re-sync missing files.
+                            try
+                            {
+                                await connection.Socket.CloseAsync(
+                                    WebSocketCloseStatus.PolicyViolation,
+                                    "Credit timeout",
+                                    CancellationToken.None);
+                            }
+                            catch { }
+
                             return;
                         }
 

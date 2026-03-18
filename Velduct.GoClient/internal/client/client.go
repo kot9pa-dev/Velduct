@@ -152,7 +152,7 @@ func (c *Client) Run() {
 			c.session.HandleDeleteConfirm(p)
 
 		case protocol.CmdFileMtimeAck:
-			c.session.HandleFileMtimeAck(payload[1:])
+			c.session.EnqueueMtimeAck(payload[1:])
 
 		case protocol.CmdCheckFiles:
 			p := append([]byte(nil), payload...)
