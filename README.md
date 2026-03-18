@@ -18,7 +18,7 @@ Client B ──upload──▶ Server ──broadcast──▶ Client A
 - Transfer format: streaming **TAR** (no temp files on the wire)
 - Auth: one-time **JWT HS256** tokens (replay-protected)
 - Atomicity: every file goes through `temp → atomic rename` on both sides
-- Conflict resolution: last-writer-wins by mtime
+- Conflict resolution: last-writer-wins by **server-authoritative mtime**
 
 ---
 
@@ -525,6 +525,29 @@ docker run -d \
   -v /host/share:/data/share \
   velduct-client
 ```
+
+---
+
+## Server-authoritative mtime
+
+The server is the single source of truth for file timestamps. Client clocks are not used for conflict resolution.
+
+```
+Client uploads file.txt (local mtime = 13:23, client clock)
+  → Server receives, stamps DateTime.UtcNow = 13:25:00.123
+  → Server writes to disk with mtime = 13:25:00.123
+  → Server → uploading client: CMD_FILE_MTIME_ACK (key, path, 13:25:00.123)
+  → Server → other clients: broadcast CHECK_FILES (key, path, 13:25:00.123)
+  → Uploading client: os.Chtimes(file.txt, 13:25:00.123)
+  → Other clients: download, os.Chtimes(file.txt, 13:25:00.123)
+  → Result: all systems have mtime = 13:25:00.123
+```
+
+**Clock skew handling:**
+- When a client edits a previously-synced file and its clock is behind the server, `ResolveReportMtime` bumps the reported mtime to `serverMtime + 1ms` to guarantee the server pulls the updated version
+- An epsilon of **2 seconds** is used for mtime comparisons across the protocol (server `ClassifyFileForPull`, client `needsDownload`, client `HandleOffer`) to tolerate filesystem timestamp rounding (FAT32 rounds to 2s, HFS+ to 1s)
+
+**Protocol:** opcode `CMD_FILE_MTIME_ACK` (`0x17`) — sent by server to the uploading client after successful disk write. Format: `[opcode][4-byte keyLen][key][4-byte pathLen][path][8-byte serverMtimeMs]`
 
 ---
 

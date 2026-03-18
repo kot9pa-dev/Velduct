@@ -198,10 +198,6 @@ public class WebSocketHandlerService : IFrameHandler
         await _sync.EnqueueFilesAsync(_session!.Connection.Socket, conn, files, ct);
     }
 
-    /// <summary>
-    /// Обрабатывает CMD_REGISTER_SHARES: клиент сообщает свои share-ключи.
-    /// Формат: [4-byte count][per key: 4-byte len + UTF8 string]
-    /// </summary>
     private void HandleRegisterShares(byte[] payload)
     {
         if (payload.Length < 4)
@@ -227,16 +223,9 @@ public class WebSocketHandlerService : IFrameHandler
         _logger.LogInformation("Client {Id} registered {Count} shares: [{Keys}].",
             _session!.Connection.Id, keys.Count, string.Join(", ", keys));
 
-        // Начальная синхронизация: отправляем клиенту все файлы из серверного кеша.
-        // Клиент сравнит с локальными и пришлёт CMD_BATCH_PULL для недостающих.
         SendCachedFilesToClient(keys);
     }
 
-    /// <summary>
-    /// Отправляет клиенту CmdCheckFiles со всеми файлами из серверного кеша
-    /// для указанных share-ключей. Батчами по ScanBatchSize.
-    /// Клиент сравнит с локальными файлами и запросит недостающие.
-    /// </summary>
     private void SendCachedFilesToClient(List<string> shareKeys)
     {
         int totalSent = 0;
@@ -267,10 +256,6 @@ public class WebSocketHandlerService : IFrameHandler
         }
     }
 
-    /// <summary>
-    /// Парсит CMD_BATCH_PULL payload и кладёт список файлов в очередь на отправку.
-    /// Вызывается из ReadLoop — не блокирует, не ожидает.
-    /// </summary>
     private void EnqueuePullRequest(byte[] payload)
     {
         if (payload.Length < 4)
@@ -315,32 +300,18 @@ public class WebSocketHandlerService : IFrameHandler
         }
     }
 
-    // --- Pull Worker ---
-
-    /// <summary>
-    /// Фоновый воркер: читает запросы из _pullRequestChannel, объединяет
-    /// накопившиеся батчи и отправляет один TAR-стрим на все файлы.
-    ///
-    /// Без объединения: 400 файлов → 400 бродкастов → 400 CMD_BATCH_PULL → 400 отдельных TAR.
-    /// С объединением: 400 файлов → первый батч приходит → drain остальных → 1-2 TAR.
-    /// </summary>
     private async Task RunPullWorkerAsync(WebSocketConnection conn, CancellationToken ct)
     {
         try
         {
             await foreach (var firstBatch in _pullRequestChannel.Reader.ReadAllAsync(ct))
             {
-                // Drain все накопившиеся батчи в один комбинированный список.
-                // Пока PullWorker ожидал ReadAllAsync, в канал могли прийти десятки/сотни
-                // мелких CMD_BATCH_PULL от бродкастов — объединяем их в один TAR.
                 var combined = new List<FileMetadata>(firstBatch);
                 while (_pullRequestChannel.Reader.TryRead(out var moreBatch))
                 {
                     combined.AddRange(moreBatch);
                 }
 
-                // Дедупликация: один и тот же файл мог прийти из нескольких бродкастов.
-                // Оставляем последнюю версию (по Key+RelativePath).
                 var deduped = combined
                     .GroupBy(f => (f.Key, f.RelativePath))
                     .Select(g => g.Last())
@@ -376,17 +347,6 @@ public class WebSocketHandlerService : IFrameHandler
         }
     }
 
-    // --- Send Loop ---
-
-    /// <summary>
-    /// Цикл отправки обычных сообщений (CmdCheckFiles, CmdBatchPull, CmdDeleteConfirm и т.д.).
-    ///
-    /// Использует SendPermit как async-мьютекс:
-    ///   - Берёт permit перед каждой отправкой, отдаёт после.
-    ///   - Когда ServerArchiveSender держит permit (TAR-стрим), SendLoop ждёт на ReadAsync.
-    ///   - Это гарантирует что TAR-данные идут без перерывов, а обычные сообщения
-    ///     отправляются в промежутках между TAR-стримами.
-    /// </summary>
     private async Task RunSendLoopAsync(WebSocketConnection conn, CancellationToken ct)
     {
         int messagesSent = 0;
@@ -403,14 +363,12 @@ public class WebSocketHandlerService : IFrameHandler
                     return;
                 }
 
-                // Ждём право на отправку (если TAR-стрим идёт — ждём его окончания)
                 await conn.SendPermit.Reader.ReadAsync(ct);
                 try
                 {
                     await SendWithRetryAsync(conn, msg, ct);
                     messagesSent++;
 
-                    // Drain: отправляем все накопившиеся пока был заблокирован
                     while (reader.TryRead(out var nextMsg))
                     {
                         if (conn.Socket.State != WebSocketState.Open)
@@ -424,7 +382,6 @@ public class WebSocketHandlerService : IFrameHandler
                 }
                 finally
                 {
-                    // Освобождаем право на отправку
                     conn.SendPermit.Writer.TryWrite(true);
                 }
             }
@@ -439,9 +396,6 @@ public class WebSocketHandlerService : IFrameHandler
         }
     }
 
-    /// <summary>
-    /// Отправляет сообщение через WebSocket с retry. После отправки возвращает буфер в пул.
-    /// </summary>
     private async Task SendWithRetryAsync(WebSocketConnection conn, OutboundMessage msg, CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
@@ -474,11 +428,8 @@ public class WebSocketHandlerService : IFrameHandler
         msg.ReturnPool?.Writer.TryWrite(msg.Data);
     }
 
-    // --- Cleanup ---
-
     private async Task CleanupSessionAsync()
     {
-        // Разрегистрируем клиента
         if (_session != null)
             _connectionManager.UnregisterClient(_session.Connection.Id);
 
@@ -488,13 +439,12 @@ public class WebSocketHandlerService : IFrameHandler
         if (_session != null)
             await _archiveProcessor.DrainAndReleaseBuffersAsync(_session);
 
-        // Завершаем канал pull-запросов — PullWorker штатно остановится
         _pullRequestChannel.Writer.TryComplete();
 
         _session?.CreateTasks.Writer.TryComplete();
         _session?.FinalizeTasks.Writer.TryComplete();
         _session?.DataChannel.Writer.TryComplete();
-        // Завершаем каналы отправки и возвращаем пулевые буферы
+
         if (_session != null)
         {
             while (_session.Connection.SendChannel.Reader.TryRead(out var stuckMsg))

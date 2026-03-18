@@ -59,7 +59,12 @@ func (r *FileReceiver) HandleOffer(payload []byte, shares map[string]string) {
 	fullPath := filepath.Join(baseDir, relPath)
 
 	if info, err := os.Stat(fullPath); err == nil {
-		if info.Size() == size && info.ModTime().UnixNano()/1e6 == mtime {
+		// Epsilon 2s covers FS mtime rounding (FAT32 → 2s, HFS+ → 1s)
+		diff := info.ModTime().UnixNano()/1e6 - mtime
+		if diff < 0 {
+			diff = -diff
+		}
+		if info.Size() == size && diff <= 2000 {
 			slog.Debug("[Receiver] File already up-to-date, skipping", "key", key, "path", relPath)
 			go r.sendFunc([]byte{protocol.CmdSkipFile})
 			return
