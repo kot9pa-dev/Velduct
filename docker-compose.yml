@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Velduct.Web/Dockerfile
+    ports:
+      - "5000:8080"
+    volumes:
+      - ./docker-data/web/target:/app/target
+      - ./docker-data/web/temp:/app/temp
+
+  client:
+    build:
+      context: .
+      dockerfile: Velduct.Client/Dockerfile
+    depends_on:
+      - web
+    volumes:
+      - ./docker-data/client/source:/app/source
+      - ./docker-data/client/temp/out:/app/temp/out
+      - ./docker-data/client/temp/input:/app/temp/input
+    environment:
+      - ClientOptions__ServerUrl=ws://web:8080/ws

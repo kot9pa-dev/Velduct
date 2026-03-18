@@ -1,0 +1,29 @@
+{
+  "server_url": "ws://127.0.0.1:5050/ws",
+  "shares": {
+    "TestShared1": "G:\\TestShared1"
+  },
+  "target_shares": [],
+  "temp_dirs": {
+    "TestShared1": "G:\\TestShared1\\.ddzs_temp"
+  },
+  "reconnect_interval_sec": 3,
+  "max_credits": 4,
+  "chunk_size_bytes": 1048576,
+  "read_buffer_size": 32768,
+  "write_buffer_overhead": 4096,
+  "credit_timeout_sec": 15,
+  "single_upload_timeout_sec": 10,
+  "scan_batch_size": 100,
+  "upload_queue_size": 100,
+  "debounce_duration_ms": 1000,
+  "startup_sync_delay_ms": 200,
+  "max_copy_retries": 5,
+  "file_lock_retry_delay_ms": 250,
+  "watcher_event_buffer_size": 256,
+  "pprof_address": "",
+  "jwt_key": "ZAMENITE_NA_REALNYY_KLYUCH_MIN_32_SIMVOLA",
+  "jwt_issuer": "VelductClient",
+  "jwt_audience": "VelductServer",
+  "jwt_ttl_seconds": 600
+}

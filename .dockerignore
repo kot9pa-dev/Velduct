@@ -1,0 +1,9 @@
+bin/
+obj/
+.vs/
+.git/
+docker-data/
+.dockerignore
+*.user
+temp/
+logs/
