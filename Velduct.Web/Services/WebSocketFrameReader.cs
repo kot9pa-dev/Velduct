@@ -61,15 +61,12 @@ public sealed class WebSocketFrameReader
                 int offset = 0;
                 int count = result.Count;
 
-                // --- Первый фрейм нового сообщения: читаем опкод ---
                 if (isNewMessage && count > 0)
                 {
                     currentOpCode = headerBuffer[0];
 
-                    // Кредит — однобайтовое сообщение или пакетное [0x20][count]
                     if (currentOpCode == Protocol.SRV_PULL_STREAM)
                     {
-                        // Пакетные кредиты: [0x20] = 1, [0x20][N] = N кредитов
                         int creditCount = (count > 1) ? headerBuffer[1] : 1;
                         if (creditCount <= 0) creditCount = 1;
                         await handler.OnCreditsAsync(creditCount, ct);
@@ -81,7 +78,6 @@ public sealed class WebSocketFrameReader
                     count -= 1;
                     messagePayloadLen = 0;
 
-                    // Архивный чанк — берём буфер из пула и копируем хвост первого фрейма
                     if (currentOpCode == Protocol.CMD_ARCHIVE_DATA && count > 0)
                     {
                         bool hasActiveArchive = await handler.HasActiveArchiveAsync();
@@ -126,7 +122,6 @@ public sealed class WebSocketFrameReader
                     continue;
                 }
 
-                // --- Обычный (не архивный) путь ---
                 if (count > 0)
                 {
                     Buffer.BlockCopy(headerBuffer, offset, messagePayload, messagePayloadLen, count);
@@ -146,7 +141,6 @@ public sealed class WebSocketFrameReader
         }
         finally
         {
-            // Возвращаем незафлашенный буфер в пул если соединение оборвалось
             if (activeChunkBuffer != null)
             {
                 _logger.LogInformation("Connection dropped with active chunk buffer in-flight, returning to pool.");

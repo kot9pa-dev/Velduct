@@ -6,8 +6,9 @@ const (
 	CmdSkipFile      byte = 0x12
 	CmdCheckFiles    byte = 0x13
 	CmdBatchPull     byte = 0x14
-	CmdDeleteConfirm byte = 0x15
+	CmdDeleteConfirm  byte = 0x15
 	CmdRegisterShares byte = 0x16
+	CmdFileMtimeAck   byte = 0x17
 	CmdFileData      byte = 0x06
 	CmdFileDone      byte = 0x07
 	SrvPullStream    byte = 0x20

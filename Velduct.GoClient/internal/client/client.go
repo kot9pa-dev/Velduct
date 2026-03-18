@@ -151,6 +151,9 @@ func (c *Client) Run() {
 			p := append([]byte(nil), payload...)
 			c.session.HandleDeleteConfirm(p)
 
+		case protocol.CmdFileMtimeAck:
+			c.session.EnqueueMtimeAck(payload[1:])
+
 		case protocol.CmdCheckFiles:
 			p := append([]byte(nil), payload...)
 			go c.session.HandleServerCheckFiles(p[1:])

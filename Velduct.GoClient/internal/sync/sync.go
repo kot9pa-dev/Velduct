@@ -20,20 +20,20 @@ type FileInfo struct {
 
 // SyncHandler handles incoming CmdCheckFiles and determines which files to download or delete.
 type SyncHandler struct {
-	shares            map[string]string
-	sendFunc          func([]byte) error
-	cancelDownload    func(string) bool
-	isRecentDownload  func(string, int64) bool
-	scanBatchSize     int
+	shares         map[string]string
+	sendFunc       func([]byte) error
+	cancelDownload func(string) bool
+	scanBatchSize  int
+	fsPrecisionMs  int64
 }
 
-func NewSyncHandler(shares map[string]string, sendFunc func([]byte) error, cancelDownload func(string) bool, isRecentDownload func(string, int64) bool, scanBatchSize int) *SyncHandler {
+func NewSyncHandler(shares map[string]string, sendFunc func([]byte) error, cancelDownload func(string) bool, scanBatchSize int, fsPrecisionMs int64) *SyncHandler {
 	return &SyncHandler{
-		shares:           shares,
-		sendFunc:         sendFunc,
-		cancelDownload:   cancelDownload,
-		isRecentDownload: isRecentDownload,
-		scanBatchSize:    scanBatchSize,
+		shares:         shares,
+		sendFunc:       sendFunc,
+		cancelDownload: cancelDownload,
+		scanBatchSize:  scanBatchSize,
+		fsPrecisionMs:  fsPrecisionMs,
 	}
 }
 
@@ -95,23 +95,23 @@ func (sh *SyncHandler) needsDownload(f FileInfo) bool {
 	fullPath := filepath.Join(baseDir, filepath.FromSlash(f.RelPath))
 	info, err := os.Stat(fullPath)
 	if err != nil {
-		// Файл не существует локально — нужно скачать
+		// File does not exist locally — needs download
 		return true
 	}
 
 	localSize := info.Size()
 	localMtimeMs := info.ModTime().UnixNano() / 1e6
 
-	if localSize == f.Size && localMtimeMs == f.MTimeMs {
-		return false
+	if localSize != f.Size {
+		return true
 	}
 
-	// Anti-echo: if file was recently downloaded and mtime matches saved value,
-	// difference is only due to FS rounding (FAT32→2s, NTFS→100ns).
-	if localSize == f.Size && sh.isRecentDownload != nil && sh.isRecentDownload(fullPath, localMtimeMs) {
-		slog.Debug("[SyncHandler] Skipping re-download (mtime rounded by FS)",
-			"key", f.Key, "path", f.RelPath,
-			"serverMs", f.MTimeMs, "localMs", localMtimeMs)
+	// Truncate both mtimes to detected FS precision before comparing.
+	// Handles FS rounding (FAT32→2s, HFS+→1s) without hardcoded epsilon.
+	localTrunc := truncateMs(localMtimeMs, sh.fsPrecisionMs)
+	serverTrunc := truncateMs(f.MTimeMs, sh.fsPrecisionMs)
+
+	if localTrunc == serverTrunc {
 		return false
 	}
 
@@ -247,6 +247,16 @@ func decodeCheckFilesPayload(payload []byte) []FileInfo {
 	}
 
 	return files
+}
+
+func truncateMs(ms, precisionMs int64) int64 {
+	if precisionMs <= 1 {
+		return ms
+	}
+	if ms >= 0 {
+		return (ms / precisionMs) * precisionMs
+	}
+	return ((ms - precisionMs + 1) / precisionMs) * precisionMs
 }
 
 // RegisterShares sends CMD_REGISTER_SHARES to server.

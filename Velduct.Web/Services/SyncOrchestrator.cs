@@ -29,6 +29,16 @@ public class SyncOrchestrator
         _deleteQueue = deleteQueue;
     }
 
+    /// <summary>
+    /// Path traversal guard: ensures resolved path stays inside DataDirectory/key.
+    /// </summary>
+    private bool IsPathSafe(string key, string relPath)
+    {
+        string shareRoot = Path.GetFullPath(Path.Combine(_options.Storage.DataDirectory, key));
+        string full = Path.GetFullPath(Path.Combine(shareRoot, relPath));
+        return full.StartsWith(shareRoot + Path.DirectorySeparatorChar) || full == shareRoot;
+    }
+
     public Task EnqueueFilesAsync(WebSocket ws, WebSocketConnection conn, IEnumerable<FileMetadata> files, CancellationToken ct)
     {
         var (filesToPull, deletedFiles, directDeletes) = ClassifyFiles(files);
@@ -63,6 +73,13 @@ public class SyncOrchestrator
 
         foreach (var file in files)
         {
+            // Path traversal protection
+            if (!IsPathSafe(file.Key, file.RelativePath))
+            {
+                _logger.LogWarning("Path traversal blocked: {Key}/{RelPath}", file.Key, file.RelativePath);
+                continue;
+            }
+
             if (file.Size == -1)
             {
                 HandleDeleteSignal(file, deletedFiles, directDeletes);
@@ -120,7 +137,12 @@ public class SyncOrchestrator
         long serverMtimeMs = new DateTimeOffset(cached.LastWriteTime).ToUnixTimeMilliseconds();
         long clientMtimeMs = new DateTimeOffset(file.LastWriteTimeUtc).ToUnixTimeMilliseconds();
 
-        if (cached.Size == file.Size && serverMtimeMs == clientMtimeMs)
+        // Tolerance covers FS rounding: FAT32→2s, HFS+→1s.
+        // Server stores read-back mtime (ms-precise on NTFS/ext4), but clients may
+        // report FS-rounded values. Without tolerance this causes infinite re-sync loops.
+        const long MtimeToleranceMs = 2000;
+
+        if (cached.Size == file.Size && Math.Abs(serverMtimeMs - clientMtimeMs) <= MtimeToleranceMs)
             return;
 
         if (clientMtimeMs > serverMtimeMs)

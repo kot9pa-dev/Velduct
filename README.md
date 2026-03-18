@@ -18,7 +18,7 @@ Client B ──upload──▶ Server ──broadcast──▶ Client A
 - Transfer format: streaming **TAR** (no temp files on the wire)
 - Auth: one-time **JWT HS256** tokens (replay-protected)
 - Atomicity: every file goes through `temp → atomic rename` on both sides
-- Conflict resolution: last-writer-wins by mtime
+- Conflict resolution: last-writer-wins by **server-authoritative mtime**
 
 ---
 
@@ -149,7 +149,7 @@ JwtSettings__ServerKeys__1=key-for-client-two
 | `ChunkSizeBytes` | int | `4194304` | Chunk size (4 MB). Must match `chunk_size_bytes` on all clients |
 | `HeaderBufferSize` | int | `65536` | WebSocket frame header buffer (64 KB) |
 | `MessagePayloadBufferSize` | int | `262144` | Non-archive message buffer (256 KB) |
-| `SendChannelCapacity` | int | `256` | Outgoing queue capacity per connection |
+| `SendChannelCapacity` | int | `4096` | Unused (outgoing queue is unbounded). Kept for backward compatibility |
 | `CreditTimeoutSeconds` | int | `60` | Credit timeout from client during server TAR send |
 | `FileLockRetryDelayMs` | int | `500` | Retry delay on locked file |
 
@@ -172,6 +172,14 @@ JwtSettings__ServerKeys__1=key-for-client-two
 | `DeleteRetryDelayMs` | int | `500` | Retry delay on locked file delete |
 | `DeleteTimestampCleanupThreshold` | int | `1000` | Threshold for stale delete-record cleanup |
 | `DeleteTimestampTtlMinutes` | int | `5` | Delete record TTL (phantom upload protection) |
+| `PullCoalescingMaxMs` | int | `2500` | Max wait time before flushing pull requests as a TAR. Match client debounce |
+| `PullCoalescingIdleMs` | int | `250` | Idle gap — if no new pull requests within this window, flush immediately |
+
+**Derived limits** (not configurable, computed from existing parameters — same as client-side `sender.go` batch worker):
+- Max files per TAR = `ScanBatchSize × MaxCredits` (default: 100 × 4 = 400)
+- Max bytes per TAR = `MaxCredits × ChunkSizeBytes` (default: 4 × 4MB = 16MB)
+
+Coalescing stops early when either limit is reached. On client side the same formula applies with client's own `max_credits` and `chunk_size_bytes`.
 
 #### Broadcast
 
@@ -244,7 +252,6 @@ TransferOptions__Disk__IoBufferSize=4194304
 ```bash
 TransferOptions__Network__MaxCredits=3
 TransferOptions__Network__NetworkPoolSize=8
-TransferOptions__Network__SendChannelCapacity=128
 TransferOptions__Broadcast__FlushIntervalMs=500
 ```
 
@@ -296,6 +303,8 @@ Priority: **env vars** > **config file** > **code defaults**
   "upload_queue_size": 500,
   "debounce_duration_ms": 2500,
   "startup_sync_delay_ms": 500,
+  "batch_coalescing_max_ms": 2500,
+  "batch_coalescing_idle_ms": 250,
 
   "max_copy_retries": 10,
   "file_lock_retry_delay_ms": 500,
@@ -340,6 +349,8 @@ All config.json keys are mirrored by environment variables. Env always takes hig
 | `UPLOAD_QUEUE_SIZE` | `upload_queue_size` | int | `500` | Single-upload queue capacity |
 | `DEBOUNCE_DURATION_MS` | `debounce_duration_ms` | int | `2500` | FS event debounce before sending to server (ms) |
 | `STARTUP_SYNC_DELAY_MS` | `startup_sync_delay_ms` | int | `500` | Delay before initial scan after connect (ms) |
+| `BATCH_COALESCING_MAX_MS` | `batch_coalescing_max_ms` | int | `2500` | Max wait time to accumulate batch before TAR send |
+| `BATCH_COALESCING_IDLE_MS` | `batch_coalescing_idle_ms` | int | `250` | Idle gap — no new batches within this → flush |
 | `WATCHER_EVENT_BUFFER_SIZE` | `watcher_event_buffer_size` | int | `512` | FS event channel buffer |
 
 #### Disk I/O
@@ -500,7 +511,7 @@ sudo journalctl -u velduct-client -f
 ### Docker (client)
 
 ```dockerfile
-FROM golang:1.21 AS builder
+FROM golang:1.25 AS builder
 WORKDIR /src
 COPY . .
 RUN go build -o velduct-client .
@@ -528,6 +539,80 @@ docker run -d \
 
 ---
 
+## Server-authoritative mtime
+
+The server is the single source of truth for file timestamps. Client clocks are not used for conflict resolution.
+
+```
+Client uploads file.txt (local mtime = 13:23, client clock)
+  → Server receives, stamps DateTime.UtcNow = 13:25:00.123
+  → Server writes to disk with mtime = 13:25:00.123
+  → Server → uploading client: CMD_FILE_MTIME_ACK (key, path, 13:25:00.123)
+  → Server → other clients: broadcast CHECK_FILES (key, path, 13:25:00.123)
+  → Uploading client: os.Chtimes(file.txt, 13:25:00.123)
+  → Other clients: download, os.Chtimes(file.txt, 13:25:00.123)
+  → Result: all systems have mtime = 13:25:00.123
+```
+
+**FS precision detection:**
+- At startup, the Go client probes each share directory by writing test timestamps and reading them back (package `internal/fsinfo`). Detected values: FAT32=2000ms, HFS+=1000ms, NTFS/APFS/ext4=1ms. Worst case across all shares is used
+- The server reads back actual mtime after `File.SetLastWriteTimeUtc` — cache, ACK, and broadcast all use the FS-normalized value (not the requested value)
+- Client-side comparisons truncate both mtimes to detected precision before comparing — no hardcoded epsilon
+- Server uses 2-second tolerance for mtime comparison in `ClassifyFileForPull` — covers cross-FS rounding when clients report FS-rounded mtime values
+- In Docker, the probe runs on the actual mounted volume — detects the real FS precision regardless of host OS
+
+**Same FS on both sides → exact comparison, zero tolerance:**
+
+When client and server share the same filesystem type (e.g., both ext4, or both NTFS), precision=1ms on both sides. Truncation is identity (`truncateMs(x, 1) = x`). Comparison is effectively exact `==`. No rounding, no lost precision — the mtime travels through the entire pipeline bit-for-bit.
+
+**Cross-FS example (server ext4, client FAT32):**
+
+Server writes `1710000000123` → read-back = `1710000000123` (ext4 preserves ms). Client receives, Chtimes → FAT32 rounds to `1710000000000`. On next comparison: `truncateMs(1710000000123, 2000) = 1710000000000` = `truncateMs(1710000000000, 2000)` → match, no unnecessary transfer.
+
+**Clock skew handling:**
+- When a client edits a previously-synced file and its clock is behind the server, `ResolveReportMtime` bumps the reported mtime to `serverMtime + fsPrecisionMs + 1` to guarantee the server pulls the updated version
+- On NTFS/ext4 (precision=1ms) bump is +2ms; on FAT32 (precision=2000ms) bump is +2001ms — adapts automatically to ensure the bumped value lands in a different truncation bucket
+
+**Anti-echo and ACK pre-store:**
+- When the server sends a mtime ACK, the client pre-stores the server mtime in `recentDownloads` immediately from the read loop (before the ACK worker runs `Chtimes`). This prevents watcher race conditions: even if the watcher fires before `Chtimes` completes, `ResolveReportMtime` already returns the correct server mtime
+- The ACK worker queue is unbounded (mutex + slice) — never drops ACKs, never blocks the read loop
+
+**Credit timeout behavior:**
+- If the server does not receive credits from a client within `CreditTimeoutSeconds`, the TAR send is aborted and the WebSocket is closed. The client reconnects and re-syncs missing files
+- On the client side, credit timeout during upload cancels the session. The reconnect loop picks up automatically
+
+**Known limitations:**
+- After client restart, `recentDownloads` is empty. Server-side 2-second tolerance covers FS rounding, but clock skew >2s may cause one extra round-trip per file on first sync. After mtime ACKs are processed, mtimes stabilize
+- If FS probe fails (read-only share, network mount error), falls back to 2000ms (FAT32 worst case). Check logs for `"Detected mtime precision"` to verify
+- Same size + same mtime (after truncation) + different content = undetectable without content hashing. This is inherent to mtime-based sync
+
+**Protocol:** opcode `CMD_FILE_MTIME_ACK` (`0x17`) — sent by server to the uploading client after successful disk write. Format: `[opcode][4-byte keyLen][key][4-byte pathLen][path][8-byte serverMtimeMs]`
+
+---
+
+## Running tests
+
+### Server (C# / xUnit)
+
+```bash
+dotnet test Velduct.Web.Tests/
+dotnet test Velduct.Web.Tests/ -v detailed
+dotnet test Velduct.Web.Tests/ --filter "ProtocolTests"
+dotnet test Velduct.Web.Tests/ --filter "MtimeIntegrationTests"
+```
+
+### Client (Go)
+
+```bash
+# bash / sh / zsh
+cd Velduct.GoClient && go test ./internal/transfer/ ./internal/sync/ -v
+
+# PowerShell (does not support &&)
+cd Velduct.GoClient; go test ./internal/transfer/ ./internal/sync/ -v; cd ..
+```
+
+---
+
 ## Critical constraints
 
 - `MaxCredits` / `max_credits` minimum **3** — lower values can deadlock the TAR uploader (double buffer pool acquisition)
@@ -536,6 +621,12 @@ docker run -d \
 - `JwtSettings.Audience` must match `jwt_audience` on every client
 - `jwt_ttl_seconds` must be less than `JwtSettings.UsedTokenStoreMinutes × 60` on the server
 - `DataDirectory` and `TempDirectory` must be on the same filesystem (same partition or volume)
+
+## Security
+
+- **Path traversal protection**: all incoming file paths (TAR entries, file offers, mtime ACKs, sync requests) are validated with `GetFullPath` + prefix check. Paths that escape the share directory are rejected and logged
+- **Input bounds validation**: protocol parsers validate `count`, `keyLen`, `pathLen` for negative values and buffer overflow before allocation
+- **Graceful shutdown**: Go client handles SIGTERM/SIGINT — closes current session cleanly, stops watcher, exits reconnect loop
 
 ---
 

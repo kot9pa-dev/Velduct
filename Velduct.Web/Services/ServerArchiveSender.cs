@@ -49,7 +49,6 @@ public sealed class ServerArchiveSender
         if (drained > 0)
             _logger.LogDebug("Drained {Count} leftover credits before TAR send.", drained);
 
-        // Захватываем эксклюзивное право на WebSocket
         await connection.SendPermit.Reader.ReadAsync(ct);
 
         int filesSent = 0;
@@ -58,7 +57,6 @@ public sealed class ServerArchiveSender
 
         try
         {
-            // 1. CmdArchiveStart — напрямую в сокет
             await connection.Socket.SendAsync(
                 Protocol.ArchiveStartMessage,
                 WebSocketMessageType.Binary, true, ct);
@@ -68,7 +66,6 @@ public sealed class ServerArchiveSender
                 pauseWriterThreshold: _options.Network.ChunkSizeBytes * 8,
                 resumeWriterThreshold: _options.Network.ChunkSizeBytes * 4));
 
-            // Producer: формирует TAR и пишет в pipe
             var producerTask = Task.Run(async () =>
             {
                 try
@@ -88,7 +85,6 @@ public sealed class ServerArchiveSender
 
                         try
                         {
-                            // File.GetLastWriteTimeUtc — прямой syscall без аллокации FileInfo объекта
                             var lastWrite = File.GetLastWriteTimeUtc(filePath);
                             string archiveName = file.Key + "/" + file.RelativePath;
 
@@ -98,8 +94,6 @@ public sealed class ServerArchiveSender
                             {
                                 try
                                 {
-                                    // Буфер 4096 — минимальный, т.к. Pipe уже буферизует (pauseWriterThreshold).
-                                    // IoBufferSize (256KB+) попадает на LOH → 101 инстанс = 26MB мёртвой памяти до GC2.
                                     dataStream = new FileStream(filePath,
                                         FileMode.Open, FileAccess.Read,
                                         FileShare.ReadWrite | FileShare.Delete,
@@ -162,11 +156,9 @@ public sealed class ServerArchiveSender
                 }
             }, ct);
 
-            // Consumer: читает из pipe чанками, ждёт кредитов, отправляет напрямую
             await SendChunkedFromPipeAsync(connection, pipe.Reader, ct);
             await producerTask;
 
-            // 3. CmdArchiveDone — напрямую в сокет
             if (connection.Socket.State == WebSocketState.Open)
             {
                 await connection.Socket.SendAsync(
@@ -174,8 +166,6 @@ public sealed class ServerArchiveSender
                     WebSocketMessageType.Binary, true, ct);
             }
 
-            // Финальный drain: отправляем всё что накопилось за время TAR-стрима
-            // (кредиты, CmdCheckFiles и т.д.) ДО освобождения SendPermit.
             await DrainSendChannelAsync(connection, ct);
         }
         catch (OperationCanceledException)
@@ -188,12 +178,9 @@ public sealed class ServerArchiveSender
         }
         finally
         {
-            // Финальный drain перед освобождением SendPermit
-            // (на случай если drain выше был пропущен из-за исключения)
             try { await DrainSendChannelAsync(connection, CancellationToken.None); }
-            catch { /* ignore — мы в finally */ }
+            catch { }
 
-            // Всегда освобождаем SendPermit
             connection.SendPermit.Writer.TryWrite(true);
         }
 
@@ -201,18 +188,6 @@ public sealed class ServerArchiveSender
             filesSent, filesSkipped, totalBytes / (1024.0 * 1024.0));
     }
 
-    /// <summary>
-    /// Читает данные из PipeReader, нарезает на чанки с префиксом CmdArchiveData
-    /// и отправляет НАПРЯМУЮ в WebSocket (SendPermit уже захвачен).
-    ///
-    /// Буферы берутся из per-connection _chunkPool и возвращаются сразу после отправки.
-    /// Без промежуточных каналов, без per-chunk CancellationTokenSource.
-    ///
-    /// ВАЖНО: Пока мы держим SendPermit, SendLoop заблокирован и не может отправлять
-    /// сообщения из SendChannel. Поэтому между чанками дренируем SendChannel и отправляем
-    /// накопившиеся сообщения сами — иначе кредиты для клиентской загрузки (от ArchiveProcessor)
-    /// застрянут в очереди, и клиент получит credit timeout.
-    /// </summary>
     private async Task SendChunkedFromPipeAsync(
         WebSocketConnection connection,
         PipeReader reader,
@@ -222,10 +197,6 @@ public sealed class ServerArchiveSender
         int creditTimeoutMs = _options.Network.CreditTimeoutSeconds * 1000;
         var pool = _chunkPool;
 
-        // Один CTS на весь стрим — переиспользуем через TryReset().
-        // Вместо Task.WhenAny + Task.Delay + .AsTask() (4-5 аллокаций на чанк)
-        // тратим 0 аллокаций когда TryRead срабатывает, и 0 дополнительных когда нет
-        // (CTS уже создан, CancelAfter переиспользует внутренний Timer).
         using var creditCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
         try
@@ -240,11 +211,8 @@ public sealed class ServerArchiveSender
 
                 while (buffer.Length > 0)
                 {
-                    // Дренируем SendChannel — отправляем накопившиеся сообщения
-                    // (кредиты для клиентской загрузки, CmdCheckFiles, и т.д.)
                     await DrainSendChannelAsync(connection, ct);
 
-                    // Ждём кредит от клиента — zero-alloc path когда TryRead работает
                     if (!connection.OutboundCredits.Reader.TryRead(out _))
                     {
                         creditCts.CancelAfter(creditTimeoutMs);
@@ -260,17 +228,27 @@ public sealed class ServerArchiveSender
                         }
                         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
                         {
-                            _logger.LogWarning("Credit timeout from client during server TAR send.");
+                            _logger.LogWarning("Credit timeout from client during server TAR send — closing connection.");
                             reader.AdvanceTo(buffer.Start);
+
+                            // Close WebSocket: client is unresponsive, further sends will also timeout.
+                            // Client will reconnect and re-sync missing files.
+                            try
+                            {
+                                await connection.Socket.CloseAsync(
+                                    WebSocketCloseStatus.PolicyViolation,
+                                    "Credit timeout",
+                                    CancellationToken.None);
+                            }
+                            catch { }
+
                             return;
                         }
 
-                        // Сбрасываем таймер для следующего чанка
                         if (!creditCts.TryReset())
-                            return; // parent ct отменён
+                            return;
                     }
 
-                    // Берём буфер из пула (блокируется если все in-flight)
                     byte[] sendBuf = await pool.Reader.ReadAsync(ct);
 
                     int takeBytes = (int)Math.Min(buffer.Length, chunkSize);
@@ -285,7 +263,6 @@ public sealed class ServerArchiveSender
                     }
                     buffer = buffer.Slice(takeBytes);
 
-                    // Отправляем напрямую в сокет (SendPermit уже наш)
                     try
                     {
                         await connection.Socket.SendAsync(
@@ -310,13 +287,6 @@ public sealed class ServerArchiveSender
         }
     }
 
-    /// <summary>
-    /// Дренирует и отправляет все накопившиеся сообщения из SendChannel.
-    /// Вызывается только когда SendPermit захвачен (мы единственный писатель в сокет).
-    /// Критически важно для кредитов: ArchiveProcessor.FlushChunkAsync() ставит
-    /// SRV_PULL_STREAM в SendChannel, но SendLoop не может их отправить пока мы
-    /// держим SendPermit → клиент не получает кредиты → credit timeout.
-    /// </summary>
     private async Task DrainSendChannelAsync(WebSocketConnection connection, CancellationToken ct)
     {
         while (connection.SendChannel.Reader.TryRead(out var msg))

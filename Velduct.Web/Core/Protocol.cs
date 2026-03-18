@@ -13,6 +13,7 @@ public static class Protocol
     public const byte CMD_BATCH_PULL = 0x14;
     public const byte CMD_DELETE_CONFIRM = 0x15;
     public const byte CMD_REGISTER_SHARES = 0x16;
+    public const byte CMD_FILE_MTIME_ACK = 0x17;
 
     public const byte CMD_FILE_DATA = 0x06;
     public const byte CMD_FILE_DONE = 0x07;
@@ -37,7 +38,6 @@ public static class Protocol
     // Single allocation; write directly without MemoryStream
     public static byte[] BuildCheckFilesMessage(IReadOnlyList<FileMetadata> files)
     {
-        // Phase 1: precise size calculation
         int totalSize = 1 + 4;
         foreach (var f in files)
         {
@@ -46,7 +46,6 @@ public static class Protocol
                        + 8 + 8;
         }
 
-        // Phase 2: write to single buffer
         byte[] buf = new byte[totalSize];
         int pos = 0;
 
@@ -109,6 +108,30 @@ public static class Protocol
                 new DateTimeOffset(f.LastWriteTimeUtc).ToUnixTimeMilliseconds());
             pos += 8;
         }
+
+        return buf;
+    }
+
+    // Single allocation; zero-copy write of server mtime ACK for uploading client
+    public static byte[] BuildFileMtimeAckMessage(string key, string relPath, long serverMtimeMs)
+    {
+        int keyByteLen = Encoding.UTF8.GetByteCount(key);
+        int pathByteLen = Encoding.UTF8.GetByteCount(relPath);
+        int totalSize = 1 + 4 + keyByteLen + 4 + pathByteLen + 8;
+
+        byte[] buf = new byte[totalSize];
+        int pos = 0;
+
+        buf[pos++] = CMD_FILE_MTIME_ACK;
+        BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(pos), keyByteLen);
+        pos += 4;
+        Encoding.UTF8.GetBytes(key, buf.AsSpan(pos));
+        pos += keyByteLen;
+        BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(pos), pathByteLen);
+        pos += 4;
+        Encoding.UTF8.GetBytes(relPath, buf.AsSpan(pos));
+        pos += pathByteLen;
+        BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(pos), serverMtimeMs);
 
         return buf;
     }
