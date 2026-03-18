@@ -273,13 +273,8 @@ public class StorageManager
         return false;
     }
 
-    /// <summary>
-    /// Снимает phantom-защиту для пути и всех его родительских папок.
-    /// Вызывается после успешной записи файла.
-    /// </summary>
     private void ClearDeleteTimestamps(string shareName, string relPath)
     {
-        // Fast path: нет удалённых путей — пропускаем Path.Combine + walk
         if (_store.DeleteTimestamps.IsEmpty) return;
 
         string fullPath = Path.Combine(_options.Storage.DataDirectory, shareName, relPath);

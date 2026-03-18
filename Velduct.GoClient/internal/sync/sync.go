@@ -18,22 +18,23 @@ type FileInfo struct {
 	MTimeMs int64
 }
 
+// mtimeEpsilonMs is the tolerance for mtime comparison (covers FAT32 2s rounding, HFS+ 1s).
+const mtimeEpsilonMs int64 = 2000
+
 // SyncHandler handles incoming CmdCheckFiles and determines which files to download or delete.
 type SyncHandler struct {
-	shares            map[string]string
-	sendFunc          func([]byte) error
-	cancelDownload    func(string) bool
-	isRecentDownload  func(string, int64) bool
-	scanBatchSize     int
+	shares         map[string]string
+	sendFunc       func([]byte) error
+	cancelDownload func(string) bool
+	scanBatchSize  int
 }
 
-func NewSyncHandler(shares map[string]string, sendFunc func([]byte) error, cancelDownload func(string) bool, isRecentDownload func(string, int64) bool, scanBatchSize int) *SyncHandler {
+func NewSyncHandler(shares map[string]string, sendFunc func([]byte) error, cancelDownload func(string) bool, scanBatchSize int) *SyncHandler {
 	return &SyncHandler{
-		shares:           shares,
-		sendFunc:         sendFunc,
-		cancelDownload:   cancelDownload,
-		isRecentDownload: isRecentDownload,
-		scanBatchSize:    scanBatchSize,
+		shares:         shares,
+		sendFunc:       sendFunc,
+		cancelDownload: cancelDownload,
+		scanBatchSize:  scanBatchSize,
 	}
 }
 
@@ -95,23 +96,19 @@ func (sh *SyncHandler) needsDownload(f FileInfo) bool {
 	fullPath := filepath.Join(baseDir, filepath.FromSlash(f.RelPath))
 	info, err := os.Stat(fullPath)
 	if err != nil {
-		// Файл не существует локально — нужно скачать
+		// File does not exist locally — needs download
 		return true
 	}
 
 	localSize := info.Size()
 	localMtimeMs := info.ModTime().UnixNano() / 1e6
 
-	if localSize == f.Size && localMtimeMs == f.MTimeMs {
-		return false
+	// Epsilon covers FS rounding (FAT32 → 2s, HFS+ → 1s).
+	diff := f.MTimeMs - localMtimeMs
+	if diff < 0 {
+		diff = -diff
 	}
-
-	// Anti-echo: if file was recently downloaded and mtime matches saved value,
-	// difference is only due to FS rounding (FAT32→2s, NTFS→100ns).
-	if localSize == f.Size && sh.isRecentDownload != nil && sh.isRecentDownload(fullPath, localMtimeMs) {
-		slog.Debug("[SyncHandler] Skipping re-download (mtime rounded by FS)",
-			"key", f.Key, "path", f.RelPath,
-			"serverMs", f.MTimeMs, "localMs", localMtimeMs)
+	if localSize == f.Size && diff <= mtimeEpsilonMs {
 		return false
 	}
 

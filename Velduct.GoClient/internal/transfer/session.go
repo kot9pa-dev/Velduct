@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/binary"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"Velduct.GoClient/internal/config"
 	"Velduct.GoClient/internal/protocol"
@@ -71,7 +73,7 @@ func NewSession(shares map[string]string, sendFunc func([]byte) error, cfg confi
 	s.tar = NewTarUploader(s.safeSend, cfg, &s.cancelledPaths)
 	s.receiver = newFileReceiver(shares, cfg.TempDirs, s.downloads, s.safeSend, cfg.MaxCredits, s.StoreDownloadedMtime)
 	s.archiveReceiver = newArchiveReceiver(shares, cfg.TempDirs, s.downloads, s.safeSend, cfg.MaxCredits, s.StoreDownloadedMtime)
-	s.syncHandler = gosync.NewSyncHandler(shares, s.safeSend, s.downloads.CancelIfActive, s.IsRecentDownload, cfg.ScanBatchSize)
+	s.syncHandler = gosync.NewSyncHandler(shares, s.safeSend, s.downloads.CancelIfActive, cfg.ScanBatchSize)
 	s.sender = newFileSender(s)
 
 	for i := 0; i < cfg.MaxCredits; i++ {
@@ -287,7 +289,8 @@ func (s *Session) IsRecentDownload(fullPath string, mtimeMs int64) bool {
 
 // ResolveReportMtime returns mtime to report to server.
 // If file unchanged since download: return server's mtime to avoid false change detection.
-// If file was modified: return current FS mtime.
+// If file was modified locally and client clock is behind server: bump to serverMtime+1
+// to guarantee the server recognizes the edit as newer than the cached version.
 func (s *Session) ResolveReportMtime(fullPath string, currentFsMtimeMs int64) int64 {
 	v, ok := s.recentDownloads.Load(fullPath)
 	if !ok {
@@ -295,9 +298,13 @@ func (s *Session) ResolveReportMtime(fullPath string, currentFsMtimeMs int64) in
 	}
 	dm := v.(downloadedMtime)
 	if dm.ActualFsMtimeMs == currentFsMtimeMs {
-		return dm.ServerMtimeMs
+		return dm.ServerMtimeMs // Unchanged since download
 	}
-	return currentFsMtimeMs
+	// File was modified locally. Ensure reported mtime > server cached version.
+	if currentFsMtimeMs > dm.ServerMtimeMs {
+		return currentFsMtimeMs
+	}
+	return dm.ServerMtimeMs + 1 // Client clock behind server — bump to ensure pull
 }
 
 func (s *Session) SendPull(key, path string) {
@@ -320,6 +327,62 @@ func (s *Session) SendOffer(key, path string, size, mtime int64) {
 	binary.Write(buf, binary.LittleEndian, size)
 	binary.Write(buf, binary.LittleEndian, mtime)
 	s.safeSend(buf.Bytes())
+}
+
+// HandleFileMtimeAck processes server-authoritative mtime ACK after successful upload.
+// Sets the server timestamp on the local file so all clients share the same mtime.
+// Registers in recentDownloads for anti-echo (watcher must not re-upload after Chtimes).
+func (s *Session) HandleFileMtimeAck(payload []byte) {
+	// payload (opcode already stripped): [4-byte keyLen][key][4-byte pathLen][path][8-byte mtimeMs]
+	if len(payload) < 4 {
+		return
+	}
+	pos := 0
+	kLen := int(int32(payload[pos]) | int32(payload[pos+1])<<8 | int32(payload[pos+2])<<16 | int32(payload[pos+3])<<24)
+	pos += 4
+	if pos+kLen > len(payload) {
+		return
+	}
+	key := string(payload[pos : pos+kLen])
+	pos += kLen
+
+	if pos+4 > len(payload) {
+		return
+	}
+	pLen := int(int32(payload[pos]) | int32(payload[pos+1])<<8 | int32(payload[pos+2])<<16 | int32(payload[pos+3])<<24)
+	pos += 4
+	if pos+pLen > len(payload) {
+		return
+	}
+	relPath := string(payload[pos : pos+pLen])
+	pos += pLen
+
+	if pos+8 > len(payload) {
+		return
+	}
+	mtimeMs := int64(payload[pos]) | int64(payload[pos+1])<<8 | int64(payload[pos+2])<<16 | int64(payload[pos+3])<<24 |
+		int64(payload[pos+4])<<32 | int64(payload[pos+5])<<40 | int64(payload[pos+6])<<48 | int64(payload[pos+7])<<56
+
+	baseDir, ok := s.Shares[key]
+	if !ok {
+		return
+	}
+
+	fullPath := filepath.Join(baseDir, filepath.FromSlash(relPath))
+
+	// Set server-authoritative mtime on local file
+	t := time.Unix(0, mtimeMs*int64(time.Millisecond))
+	if err := os.Chtimes(fullPath, t, t); err != nil {
+		slog.Debug("[Session] Failed to set server mtime from ACK", "path", fullPath, "err", err)
+		return
+	}
+
+	// Store for anti-echo: next watcher trigger must not re-upload
+	if fi, err := os.Stat(fullPath); err == nil {
+		s.StoreDownloadedMtime(fullPath, mtimeMs, fi.ModTime().UnixNano()/1e6)
+	}
+
+	slog.Debug("[Session] Server mtime set from ACK", "key", key, "path", relPath, "mtimeMs", mtimeMs)
 }
 
 func decodeBatchPayload(payload []byte) []ArchiveFile {

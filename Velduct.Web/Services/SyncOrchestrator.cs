@@ -120,7 +120,8 @@ public class SyncOrchestrator
         long serverMtimeMs = new DateTimeOffset(cached.LastWriteTime).ToUnixTimeMilliseconds();
         long clientMtimeMs = new DateTimeOffset(file.LastWriteTimeUtc).ToUnixTimeMilliseconds();
 
-        if (cached.Size == file.Size && serverMtimeMs == clientMtimeMs)
+        // Epsilon 2s covers FS mtime rounding (FAT32 → 2s, HFS+ → 1s)
+        if (cached.Size == file.Size && Math.Abs(serverMtimeMs - clientMtimeMs) <= 2000)
             return;
 
         if (clientMtimeMs > serverMtimeMs)

@@ -55,9 +55,7 @@ public sealed class GlobalBroadcastFlusherService : IHostedService
     private async Task RunFlusherAsync(CancellationToken ct)
     {
         var accumulated = new List<BroadcastEntry>(64);
-        // Переиспользуемый словарь — не аллоцируем каждые 200мс
         var groups = new Dictionary<(Guid, string), List<FileMetadata>>();
-        // Пул списков FileMetadata — возвращаем после отправки
         var listPool = new List<List<FileMetadata>>(8);
 
         try
@@ -88,7 +86,6 @@ public sealed class GlobalBroadcastFlusherService : IHostedService
         }
         catch (OperationCanceledException) { }
 
-        // Финальный flush
         while (_queue.Reader.TryRead(out var leftover))
         {
             accumulated.Add(leftover);
@@ -106,13 +103,11 @@ public sealed class GlobalBroadcastFlusherService : IHostedService
     {
         if (entries.Count == 0) return;
 
-        // Группируем — переиспользуем контейнеры
         foreach (var e in entries)
         {
             var groupKey = (e.SourceConnectionId, e.Key);
             if (!groups.TryGetValue(groupKey, out var list))
             {
-                // Берём список из пула или создаём новый (один раз)
                 if (listPool.Count > 0)
                 {
                     list = listPool[listPool.Count - 1];
@@ -141,7 +136,6 @@ public sealed class GlobalBroadcastFlusherService : IHostedService
         _logger.LogDebug("Broadcast flusher: sent {Total} file notifications in {Groups} batch(es).",
             entries.Count, groups.Count);
 
-        // Возвращаем списки в пул, очищаем для переиспользования
         foreach (var kvp in groups)
         {
             kvp.Value.Clear();

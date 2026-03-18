@@ -61,7 +61,6 @@ public sealed class SingleFileReceiver : IAsyncDisposable
 
         try
         {
-            // Буфер 4096 — данные пишутся чанками из WebSocket, не нужен большой внутренний буфер.
             var fs = new FileStream(_tempPath, FileMode.Create, FileAccess.Write,
                 FileShare.None, 4096, true);
             if (_currentFile.Size > 0)
@@ -88,9 +87,6 @@ public sealed class SingleFileReceiver : IAsyncDisposable
         _logger.LogDebug("Offer accepted for {Key}/{RelPath}, size={Size}.", key, _currentFile.RelativePath, size);
     }
 
-    /// <summary>
-    /// Обрабатывает входящий чанк CMD_FILE_DATA: пишет в открытый FileStream.
-    /// </summary>
     public async Task HandleDataAsync(WebSocketConnection conn, byte[] headerBuffer, int offset, int count, CancellationToken ct)
     {
         if (_currentStream == null)
@@ -106,9 +102,6 @@ public sealed class SingleFileReceiver : IAsyncDisposable
             true);
     }
 
-    /// <summary>
-    /// Обрабатывает CMD_FILE_DONE: закрывает поток и ставит задачу на перемещение файла.
-    /// </summary>
     public async Task HandleDoneAsync(TransferSession session)
     {
         if (_currentStream == null || _currentFile == null)
@@ -120,11 +113,15 @@ public sealed class SingleFileReceiver : IAsyncDisposable
         await _currentStream.DisposeAsync();
         _currentStream = null;
 
+        // Server-authoritative mtime: stamp server time as the canonical version timestamp.
+        // Client clocks are untrusted; server time is the single source of truth for conflict resolution.
+        var serverMtime = DateTime.UtcNow;
+
         var task = new FileDiskTask(
             _currentFile.Key,
             _currentFile.RelativePath,
             _currentFile.Size,
-            _currentFile.LastWriteTimeUtc,
+            serverMtime,
             _finalPath,
             _tempPath);
 
@@ -138,9 +135,6 @@ public sealed class SingleFileReceiver : IAsyncDisposable
         _tempPath = null;
     }
 
-    /// <summary>
-    /// Закрывает текущий поток и удаляет незавершённый временный файл.
-    /// </summary>
     public async Task CloseCurrentFileAsync()
     {
         if (_currentStream != null)
