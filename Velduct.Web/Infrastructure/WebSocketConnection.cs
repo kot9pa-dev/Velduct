@@ -10,7 +10,9 @@ public class WebSocketConnection
 
     public WebSocket Socket { get; }
 
-    // Outbound message queue; SendLoop drains continuously to socket
+    // Outbound message queue; SendLoop drains continuously to socket.
+    // Unbounded: EnqueueSend never blocks, never drops.
+    // Memory bounded by CreditTimeoutSeconds — stalled TAR send aborts, SendPermit released, queue drains.
     public Channel<OutboundMessage> SendChannel { get; }
 
     // Flow control credits; each incoming SRV_PULL_STREAM byte grants one chunk send
@@ -23,24 +25,20 @@ public class WebSocketConnection
     {
         Socket = socket;
         OutboundCredits = Channel.CreateBounded<byte>(maxCredits);
-        SendChannel = Channel.CreateBounded<OutboundMessage>(
-            new BoundedChannelOptions(sendChannelCapacity)
-            {
-                FullMode = BoundedChannelFullMode.Wait,
-                SingleReader = true
-            });
+
+        SendChannel = Channel.CreateUnbounded<OutboundMessage>(new UnboundedChannelOptions
+        {
+            SingleReader = true
+        });
 
         SendPermit.Writer.TryWrite(true);
     }
 
     public void EnqueueSend(byte[] buffer, WebSocketMessageType type, bool endOfMessage)
     {
-        if (!SendChannel.Writer.TryWrite(new OutboundMessage(buffer, type, endOfMessage)))
-        {
-            // Bounded channel full (256 capacity) — message dropped.
-            // Should not happen: SendLoop drains continuously, DrainSendChannelAsync runs during TAR sends.
-            System.Diagnostics.Debug.WriteLine(
-                $"[WebSocketConnection] SendChannel full, message dropped (opcode=0x{buffer[0]:X2}, len={buffer.Length})");
-        }
+        if (Socket.State != WebSocketState.Open)
+            return;
+
+        SendChannel.Writer.TryWrite(new OutboundMessage(buffer, type, endOfMessage));
     }
 }

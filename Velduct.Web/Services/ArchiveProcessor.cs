@@ -231,7 +231,16 @@ public sealed class ArchiveProcessor
 
                 string key = name.Substring(0, slashIdx);
                 string relPath = name.Substring(slashIdx + 1);
-                string finalPath = System.IO.Path.Combine(_options.Storage.DataDirectory, key, relPath);
+
+                // Path traversal protection: reject entries that escape the share directory
+                string shareRoot = System.IO.Path.GetFullPath(System.IO.Path.Combine(_options.Storage.DataDirectory, key));
+                string finalPath = System.IO.Path.GetFullPath(System.IO.Path.Combine(shareRoot, relPath));
+                if (!finalPath.StartsWith(shareRoot + System.IO.Path.DirectorySeparatorChar) && finalPath != shareRoot)
+                {
+                    _logger.LogWarning("Path traversal blocked in TAR entry: {Name} resolved to {Path}", name, finalPath);
+                    continue;
+                }
+
                 DateTime processingStartTime = DateTime.UtcNow;
 
                 if (_storage.IsPhantomUpload(finalPath, processingStartTime))

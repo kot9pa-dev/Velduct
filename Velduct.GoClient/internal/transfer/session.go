@@ -44,6 +44,12 @@ type Session struct {
 	// Used for anti-echo and to report server's mtime to avoid false change detection.
 	recentDownloads sync.Map
 
+	// mtimeAckQueue is an unbounded queue for mtime ACK payloads.
+	// Serializes Chtimes calls without ever blocking the read loop or dropping ACKs.
+	mtimeAckMu   sync.Mutex
+	mtimeAckQueue [][]byte
+	mtimeAckNotify chan struct{}
+
 	downloads *DownloadTracker
 
 	receiver *FileReceiver
@@ -63,7 +69,7 @@ func NewSession(shares map[string]string, sendFunc func([]byte) error, cfg confi
 		SendFunc:      sendFunc,
 		credits:       make(chan struct{}, cfg.MaxCredits),
 		uploadBufPool: make(chan []byte, cfg.MaxCredits),
-		batchQueue:    make(chan []ArchiveFile, cfg.MaxCredits),
+		batchQueue:    make(chan []ArchiveFile, cfg.MaxCredits*cfg.ScanBatchSize),
 		singleQueue:   make(chan uploadTask, cfg.UploadQueueSize),
 		ctx:           ctx,
 		cancel:        cancel,
@@ -71,18 +77,21 @@ func NewSession(shares map[string]string, sendFunc func([]byte) error, cfg confi
 
 	s.downloads = NewDownloadTracker()
 	s.tar = NewTarUploader(s.safeSend, cfg, &s.cancelledPaths)
-	s.receiver = newFileReceiver(shares, cfg.TempDirs, s.downloads, s.safeSend, cfg.MaxCredits, s.StoreDownloadedMtime)
+	s.receiver = newFileReceiver(shares, cfg.TempDirs, s.downloads, s.safeSend, cfg.MaxCredits, s.StoreDownloadedMtime, cfg.FsPrecisionMs)
 	s.archiveReceiver = newArchiveReceiver(shares, cfg.TempDirs, s.downloads, s.safeSend, cfg.MaxCredits, s.StoreDownloadedMtime)
-	s.syncHandler = gosync.NewSyncHandler(shares, s.safeSend, s.downloads.CancelIfActive, cfg.ScanBatchSize)
+	s.syncHandler = gosync.NewSyncHandler(shares, s.safeSend, s.downloads.CancelIfActive, cfg.ScanBatchSize, cfg.FsPrecisionMs)
 	s.sender = newFileSender(s)
+
+	s.mtimeAckNotify = make(chan struct{}, 1)
 
 	for i := 0; i < cfg.MaxCredits; i++ {
 		s.uploadBufPool <- make([]byte, cfg.ChunkSizeBytes)
 	}
 
-	s.wg.Add(2)
+	s.wg.Add(3)
 	go s.sender.runBatchWorker()
 	go s.sender.runSingleUploadWorker()
+	go s.runMtimeAckWorker()
 
 	slog.Debug("[Session] Created", "max_credits", cfg.MaxCredits, "chunk_kb", cfg.ChunkSizeBytes/1024)
 	return s
@@ -100,6 +109,13 @@ func (s *Session) Close() {
 	s.receiver.CloseAndCleanup()
 
 	s.wg.Wait()
+
+	// Clear recentDownloads to release memory (session is done)
+	s.recentDownloads.Range(func(key, _ any) bool {
+		s.recentDownloads.Delete(key)
+		return true
+	})
+
 	slog.Debug("[Session] All workers stopped.")
 }
 
@@ -304,7 +320,7 @@ func (s *Session) ResolveReportMtime(fullPath string, currentFsMtimeMs int64) in
 	if currentFsMtimeMs > dm.ServerMtimeMs {
 		return currentFsMtimeMs
 	}
-	return dm.ServerMtimeMs + 1 // Client clock behind server — bump to ensure pull
+	return dm.ServerMtimeMs + s.Config.FsPrecisionMs + 1
 }
 
 func (s *Session) SendPull(key, path string) {
@@ -332,8 +348,121 @@ func (s *Session) SendOffer(key, path string, size, mtime int64) {
 // HandleFileMtimeAck processes server-authoritative mtime ACK after successful upload.
 // Sets the server timestamp on the local file so all clients share the same mtime.
 // Registers in recentDownloads for anti-echo (watcher must not re-upload after Chtimes).
-func (s *Session) HandleFileMtimeAck(payload []byte) {
-	// payload (opcode already stripped): [4-byte keyLen][key][4-byte pathLen][path][8-byte mtimeMs]
+// EnqueueMtimeAck enqueues a mtime ACK payload for serial processing by the worker.
+// Safe to call from the read loop — non-blocking (buffered channel).
+func (s *Session) EnqueueMtimeAck(payload []byte) {
+	// Copy payload: caller may reuse the buffer.
+	// MUST NOT block: called from read loop. Unbounded queue — never drops, never blocks.
+	p := make([]byte, len(payload))
+	copy(p, payload)
+
+	// CRITICAL: pre-store server mtime in recentDownloads IMMEDIATELY (from read loop).
+	// This prevents the watcher race: ACK worker calls Chtimes → watcher fires →
+	// batch includes files whose ACK isn't processed yet → ResolveReportMtime returns
+	// original FS mtime (wrong) → server pulls → infinite re-upload loop.
+	// Parsing is cheap (no I/O), so safe to do in read loop.
+	s.preStoreAckMtime(p)
+
+	s.mtimeAckMu.Lock()
+	s.mtimeAckQueue = append(s.mtimeAckQueue, p)
+	s.mtimeAckMu.Unlock()
+
+	// Non-blocking notify — worker will drain the entire queue
+	select {
+	case s.mtimeAckNotify <- struct{}{}:
+	default:
+	}
+}
+
+// preStoreAckMtime parses the ACK payload and stores server mtime in recentDownloads.
+// Called from read loop (no I/O, no blocking). Worker later does actual Chtimes + stat.
+func (s *Session) preStoreAckMtime(payload []byte) {
+	if len(payload) < 4 {
+		return
+	}
+	pos := 0
+	kLen := int(int32(payload[pos]) | int32(payload[pos+1])<<8 | int32(payload[pos+2])<<16 | int32(payload[pos+3])<<24)
+	pos += 4
+	if kLen < 0 || pos+kLen > len(payload) {
+		return
+	}
+	key := string(payload[pos : pos+kLen])
+	pos += kLen
+	if pos+4 > len(payload) {
+		return
+	}
+	pLen := int(int32(payload[pos]) | int32(payload[pos+1])<<8 | int32(payload[pos+2])<<16 | int32(payload[pos+3])<<24)
+	pos += 4
+	if pLen < 0 || pos+pLen > len(payload) {
+		return
+	}
+	relPath := string(payload[pos : pos+pLen])
+	pos += pLen
+	if pos+8 > len(payload) {
+		return
+	}
+	mtimeMs := int64(payload[pos]) | int64(payload[pos+1])<<8 | int64(payload[pos+2])<<16 | int64(payload[pos+3])<<24 |
+		int64(payload[pos+4])<<32 | int64(payload[pos+5])<<40 | int64(payload[pos+6])<<48 | int64(payload[pos+7])<<56
+
+	baseDir, ok := s.Shares[key]
+	if !ok {
+		return
+	}
+	fullPath := filepath.Join(baseDir, filepath.FromSlash(relPath))
+
+	// Store estimated mtime — worker will update with actual FS mtime after Chtimes.
+	// This ensures ResolveReportMtime returns server mtime even before Chtimes runs.
+	s.StoreDownloadedMtime(fullPath, mtimeMs, mtimeMs)
+}
+
+// runMtimeAckWorker processes mtime ACKs serially — prevents concurrent
+// Chtimes on the same file which would corrupt recentDownloads.
+// Uses unbounded queue: never drops ACKs, never blocks the read loop.
+func (s *Session) runMtimeAckWorker() {
+	defer s.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("[Session] Mtime ACK worker panicked", "recover", r)
+		}
+	}()
+	for {
+		select {
+		case <-s.ctx.Done():
+			// Drain remaining ACKs before exit
+			s.drainMtimeAckQueue()
+			return
+		case <-s.mtimeAckNotify:
+			s.drainMtimeAckQueue()
+		}
+	}
+}
+
+func (s *Session) drainMtimeAckQueue() {
+	for {
+		s.mtimeAckMu.Lock()
+		if len(s.mtimeAckQueue) == 0 {
+			s.mtimeAckMu.Unlock()
+			return
+		}
+		// Take all pending items at once to minimize lock hold time
+		batch := s.mtimeAckQueue
+		s.mtimeAckQueue = nil
+		s.mtimeAckMu.Unlock()
+
+		for _, payload := range batch {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("[Session] Panic in mtime ACK handler", "recover", r)
+					}
+				}()
+				s.handleFileMtimeAck(payload)
+			}()
+		}
+	}
+}
+
+func (s *Session) handleFileMtimeAck(payload []byte) {
 	if len(payload) < 4 {
 		return
 	}
@@ -370,14 +499,24 @@ func (s *Session) HandleFileMtimeAck(payload []byte) {
 
 	fullPath := filepath.Join(baseDir, filepath.FromSlash(relPath))
 
-	// Set server-authoritative mtime on local file
+	// Path traversal protection
+	absBase, _ := filepath.Abs(baseDir)
+	absFull, _ := filepath.Abs(fullPath)
+	if !isSubPath(absBase, absFull) {
+		slog.Warn("[Session] Path traversal blocked in mtime ACK", "key", key, "path", relPath)
+		return
+	}
+
+	// Pre-store with estimated mtime to prevent watcher race between Chtimes and Store.
+	s.StoreDownloadedMtime(fullPath, mtimeMs, mtimeMs)
+
 	t := time.Unix(0, mtimeMs*int64(time.Millisecond))
 	if err := os.Chtimes(fullPath, t, t); err != nil {
 		slog.Debug("[Session] Failed to set server mtime from ACK", "path", fullPath, "err", err)
 		return
 	}
 
-	// Store for anti-echo: next watcher trigger must not re-upload
+	// Update with actual FS mtime (may differ from requested due to FS rounding)
 	if fi, err := os.Stat(fullPath); err == nil {
 		s.StoreDownloadedMtime(fullPath, mtimeMs, fi.ModTime().UnixNano()/1e6)
 	}

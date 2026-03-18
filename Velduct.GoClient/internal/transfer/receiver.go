@@ -14,12 +14,13 @@ import (
 // Lifecycle: HandleOffer → N×HandleData → HandleDone.
 // File: write to .ddzs_temp/ → atomic rename to share.
 type FileReceiver struct{
-	shares     map[string]string
-	tempDirs   map[string]string
-	downloads  *DownloadTracker
-	storeMtime func(fullPath string, serverMs, actualFsMs int64)
-	sendFunc   func([]byte) error
-	credits    int
+	shares        map[string]string
+	tempDirs      map[string]string
+	downloads     *DownloadTracker
+	storeMtime    func(fullPath string, serverMs, actualFsMs int64)
+	sendFunc      func([]byte) error
+	credits       int
+	fsPrecisionMs int64
 
 	mu           sync.Mutex
 	isReceiving  bool
@@ -31,14 +32,15 @@ type FileReceiver struct{
 	expectedTime int64
 }
 
-func newFileReceiver(shares map[string]string, tempDirs map[string]string, downloads *DownloadTracker, sendFunc func([]byte) error, credits int, storeMtime func(string, int64, int64)) *FileReceiver {
+func newFileReceiver(shares map[string]string, tempDirs map[string]string, downloads *DownloadTracker, sendFunc func([]byte) error, credits int, storeMtime func(string, int64, int64), fsPrecisionMs int64) *FileReceiver {
 	return &FileReceiver{
-		shares:     shares,
-		tempDirs:   tempDirs,
-		downloads:  downloads,
-		storeMtime: storeMtime,
-		sendFunc:   sendFunc,
-		credits:    credits,
+		shares:        shares,
+		tempDirs:      tempDirs,
+		downloads:     downloads,
+		storeMtime:    storeMtime,
+		sendFunc:      sendFunc,
+		credits:       credits,
+		fsPrecisionMs: fsPrecisionMs,
 	}
 }
 
@@ -58,13 +60,17 @@ func (r *FileReceiver) HandleOffer(payload []byte, shares map[string]string) {
 
 	fullPath := filepath.Join(baseDir, relPath)
 
+	// Path traversal protection
+	absBase, _ := filepath.Abs(baseDir)
+	absFull, _ := filepath.Abs(fullPath)
+	if !isSubPath(absBase, absFull) {
+		slog.Warn("[Receiver] Path traversal blocked", "key", key, "path", relPath)
+		return
+	}
+
 	if info, err := os.Stat(fullPath); err == nil {
-		// Epsilon 2s covers FS mtime rounding (FAT32 → 2s, HFS+ → 1s)
-		diff := info.ModTime().UnixNano()/1e6 - mtime
-		if diff < 0 {
-			diff = -diff
-		}
-		if info.Size() == size && diff <= 2000 {
+		localMs := info.ModTime().UnixNano() / 1e6
+		if info.Size() == size && truncateMtimeMs(localMs, r.fsPrecisionMs) == truncateMtimeMs(mtime, r.fsPrecisionMs) {
 			slog.Debug("[Receiver] File already up-to-date, skipping", "key", key, "path", relPath)
 			go r.sendFunc([]byte{protocol.CmdSkipFile})
 			return
@@ -117,7 +123,14 @@ func (r *FileReceiver) HandleData(data []byte) {
 	}
 
 	if _, err := r.file.Write(data); err != nil {
-		slog.Error("[Receiver] Write failed", "path", r.relPath, "err", err)
+		slog.Error("[Receiver] Write failed, aborting transfer", "path", r.relPath, "err", err)
+		// Abort: close file, mark not receiving. HandleDone will see isReceiving=false.
+		tempPath := r.file.Name()
+		r.file.Close()
+		r.file = nil
+		r.isReceiving = false
+		os.Remove(tempPath)
+		r.downloads.Unregister(r.finalPath)
 		return
 	}
 	go r.sendFunc([]byte{protocol.SrvPullStream})
@@ -222,6 +235,22 @@ func (r *FileReceiver) CloseAndCleanup() {
 }
 
 // --- Helpers ---
+
+func isSubPath(base, target string) bool {
+	base = filepath.Clean(base) + string(filepath.Separator)
+	target = filepath.Clean(target) + string(filepath.Separator)
+	return len(target) >= len(base) && target[:len(base)] == base
+}
+
+func truncateMtimeMs(ms, precisionMs int64) int64 {
+	if precisionMs <= 1 {
+		return ms
+	}
+	if ms >= 0 {
+		return (ms / precisionMs) * precisionMs
+	}
+	return ((ms - precisionMs + 1) / precisionMs) * precisionMs
+}
 
 func decodeOfferPayload(payload []byte) (key, relPath string, size, mtime int64, ok bool) {
 	if len(payload) < 9 {

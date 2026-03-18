@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"Velduct.GoClient/internal/protocol"
 )
@@ -184,6 +185,14 @@ func (ar *ArchiveReceiver) unpackLoop() {
 func (ar *ArchiveReceiver) extractEntry(tr *tar.Reader, header *tar.Header, baseDir, key, relPath string) error {
 	fullPath := filepath.Join(baseDir, filepath.FromSlash(relPath))
 
+	// Path traversal protection
+	absBase, _ := filepath.Abs(baseDir)
+	absFull, _ := filepath.Abs(fullPath)
+	if !isSubPath(absBase, absFull) {
+		slog.Warn("[ArchiveReceiver] Path traversal blocked", "key", key, "path", relPath)
+		return nil
+	}
+
 	// Write to temp dir on same filesystem for atomic rename
 	tempDir := ResolveTempDir(ar.tempDirs, key)
 	if err := os.MkdirAll(tempDir, 0755); err != nil {
@@ -222,10 +231,24 @@ func (ar *ArchiveReceiver) extractEntry(tr *tar.Reader, header *tar.Header, base
 		return err
 	}
 
-	if err := os.Rename(tempFile.Name(), fullPath); err != nil {
-		os.Remove(tempFile.Name())
-		ar.downloads.Unregister(fullPath)
-		return err
+	// Retry rename indefinitely while temp file exists: on Windows, antivirus/indexer/explorer
+	// may briefly lock the target. Consistent with server-side DiskWorkerService retry policy.
+	for attempt := 0; ; attempt++ {
+		err = os.Rename(tempFile.Name(), fullPath)
+		if err == nil {
+			break
+		}
+		// If temp file was removed externally, abort
+		if _, statErr := os.Stat(tempFile.Name()); statErr != nil {
+			ar.downloads.Unregister(fullPath)
+			return err
+		}
+		if attempt == 0 {
+			slog.Debug("[ArchiveReceiver] Rename locked, retrying", "path", relPath, "err", err)
+		} else if attempt%20 == 0 {
+			slog.Warn("[ArchiveReceiver] Still waiting to rename", "path", relPath, "attempts", attempt)
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 
 	ar.downloads.Unregister(fullPath)

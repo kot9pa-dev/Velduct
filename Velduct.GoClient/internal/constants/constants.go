@@ -18,10 +18,12 @@ const (
 	EnvCreditTimeoutSec       = "CREDIT_TIMEOUT_SEC"
 	EnvSingleUploadTimeoutSec = "SINGLE_UPLOAD_TIMEOUT_SEC"
 
-	EnvScanBatchSize      = "SCAN_BATCH_SIZE"
-	EnvUploadQueueSize    = "UPLOAD_QUEUE_SIZE"
-	EnvDebounceDurationMs = "DEBOUNCE_DURATION_MS"
-	EnvStartupSyncDelayMs = "STARTUP_SYNC_DELAY_MS"
+	EnvScanBatchSize          = "SCAN_BATCH_SIZE"
+	EnvUploadQueueSize        = "UPLOAD_QUEUE_SIZE"
+	EnvDebounceDurationMs     = "DEBOUNCE_DURATION_MS"
+	EnvStartupSyncDelayMs     = "STARTUP_SYNC_DELAY_MS"
+	EnvBatchCoalescingMaxMs   = "BATCH_COALESCING_MAX_MS"
+	EnvBatchCoalescingIdleMs  = "BATCH_COALESCING_IDLE_MS"
 
 	EnvMaxCopyRetries       = "MAX_COPY_RETRIES"
 	EnvFileLockRetryDelayMs = "FILE_LOCK_RETRY_DELAY_MS"

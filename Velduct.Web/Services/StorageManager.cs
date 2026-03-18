@@ -27,6 +27,8 @@ public class StorageManager
         if (!Directory.Exists(_options.Storage.DataDirectory))
             Directory.CreateDirectory(_options.Storage.DataDirectory);
 
+        CleanupTempDirectory();
+
         var shareDirs = Directory.GetDirectories(_options.Storage.DataDirectory);
         _logger.LogInformation("Found {Count} share directories.", shareDirs.Length);
 
@@ -34,6 +36,37 @@ public class StorageManager
 
         _store.IsReady = true;
         _logger.LogInformation("VFS indexing complete. Cache ready.");
+    }
+
+    private void CleanupTempDirectory()
+    {
+        var tempDir = _options.Storage.TempDirectory;
+        if (!Directory.Exists(tempDir))
+            return;
+
+        int cleaned = 0;
+        try
+        {
+            foreach (var file in Directory.GetFiles(tempDir, "*", SearchOption.TopDirectoryOnly))
+            {
+                try
+                {
+                    File.Delete(file);
+                    cleaned++;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Could not delete orphan temp file: {File}", file);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to scan TempDirectory for cleanup: {Dir}", tempDir);
+        }
+
+        if (cleaned > 0)
+            _logger.LogInformation("Cleaned {Count} orphan temp files from {Dir}.", cleaned, tempDir);
     }
 
     private void IndexShareDirectory(string shareDir)
