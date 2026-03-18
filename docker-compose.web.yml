@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  web:
+    container_name: ddzs-file-transfer-web
+    build:
+      context: .
+      dockerfile: Velduct.Web/Dockerfile
+    ports:
+      - "5050:8080"
+    volumes:
+      - ./docker-data/web/data:/app/data
+      - ./docker-data/web/temp:/app/temp
+      - ./docker-data/web/logs:/app/logs
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - TransferOptions__DataDirectory=/app/data
+      - TransferOptions__Storage__TempDirectory=/app/temp
+
+      # JWT — задайте свои значения (минимум 32 символа для ключей)
+      - JwtSettings__Audience=VelductServer
+      - JwtSettings__ClockSkewMinutes=1
+      - JwtSettings__UsedTokenStoreMinutes=6
+      # Ключи клиентов через __0, __1, ... (можно добавить несколько)
+      - JwtSettings__ServerKeys__0=aC7siL2qtV0wdH8jrI6pfU3uyKcuN411
+    restart: unless-stopped

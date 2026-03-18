@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  client1:
+    build:
+      context: .
+      dockerfile: Velduct.Client/Dockerfile
+    volumes:
+      # Монтируем реальную папку G:\TestShared1 в контейнер
+      - G:\TestShared1:C:\app\source\SharedData
+      - ./docker-data/client1/temp/out:C:\app\temp\out
+      - ./docker-data/client1/temp/input:C:\app\temp\input
+    environment:
+      # Указываем хост машины (host.docker.internal прокинет на web:5000)
+      - ClientOptions__ServerUrl=ws://host.docker.internal:5000/ws
+      # Привязываем ключ синхронизации "SharedData" к смонтированной директории
+      - ClientOptions__SourceDirs__SharedData=C:\app\source\SharedData
+
+  client2:
+    build:
+      context: .
+      dockerfile: Velduct.Client/Dockerfile
+    volumes:
+      # Монтируем реальную папку G:\TestShared2 в контейнер
+      - G:\TestShared2:C:\app\source\SharedData
+      - ./docker-data/client2/temp/out:C:\app\temp\out
+      - ./docker-data/client2/temp/input:C:\app\temp\input
+    environment:
+      - ClientOptions__ServerUrl=ws://host.docker.internal:5000/ws
+      - ClientOptions__SourceDirs__SharedData=C:\app\source\SharedData

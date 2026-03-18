@@ -1,0 +1,27 @@
+# Build outputs
+bin/
+obj/
+*.user
+.vs/
+
+# Go binaries
+Velduct.GoClient/velduct-client
+Velduct.GoClient/velduct-client.exe
+Velduct.GoClient/velduct-client-linux
+
+# Docker data
+docker-data/
+
+# Client config files (contain secrets)
+# Velduct.GoClient/config.json
+Velduct.GoClient/config.dev.json
+Velduct.GoClient/config.dev2.json
+Velduct.GoClient/config.*.json
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
