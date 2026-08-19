@@ -16,6 +16,7 @@ import (
 	"Velduct.GoClient/internal/config"
 	"Velduct.GoClient/internal/constants"
 	jwtutil "Velduct.GoClient/internal/jwt"
+	"Velduct.GoClient/internal/liveness"
 	"Velduct.GoClient/internal/protocol"
 	gosync "Velduct.GoClient/internal/sync"
 	"Velduct.GoClient/internal/transfer"
@@ -58,8 +59,9 @@ func (c *Client) Connect() error {
 
 	// WriteBufferSize must match ChunkSizeBytes to avoid 1000+ syscalls per large chunk.
 	dialer := websocket.Dialer{
-		WriteBufferSize: c.Config.ChunkSizeBytes + c.Config.WriteBufferOverhead,
-		ReadBufferSize:  c.Config.ReadBufferSize,
+		WriteBufferSize:  c.Config.ChunkSizeBytes + c.Config.WriteBufferOverhead,
+		ReadBufferSize:   c.Config.ReadBufferSize,
+		HandshakeTimeout: time.Duration(c.Config.HandshakeTimeoutSec) * time.Second,
 	}
 
 	c.conn, _, err = dialer.Dial(connectURL.String(), nil)
@@ -87,12 +89,20 @@ func (c *Client) SafeSend(data []byte) error {
 func (c *Client) Run() {
 	slog.Info("[Client] Session started")
 
+	mon := liveness.New(c.conn,
+		time.Duration(c.Config.LivenessIdleTimeoutSec)*time.Second,
+		time.Duration(c.Config.LivenessPingIntervalSec)*time.Second,
+		func() error { return c.SafeSend([]byte{protocol.CmdHeartbeat}) })
+	go mon.Run()
+	defer mon.Stop()
+
 	for {
 		_, payload, err := c.conn.ReadMessage()
 		if err != nil {
 			slog.Error("[Client] WebSocket disconnected", "err", err)
 			return
 		}
+		mon.Mark() // any inbound frame (data / metadata / control) = backend alive
 
 		if len(payload) == 0 {
 			continue
@@ -169,6 +179,9 @@ func (c *Client) Run() {
 			c.session.HandleArchiveDone()
 			c.receivingArchive = false
 
+		case protocol.CmdHeartbeat:
+			// Server liveness heartbeat; mon.Mark() above already recorded it.
+
 		default:
 			slog.Warn("[Client] Unknown opcode received", "opcode", opCode)
 		}
@@ -197,6 +210,7 @@ func (c *Client) SyncAllShares() {
 	if c.session == nil {
 		return
 	}
+	ctx := c.session.Context()
 
 	for key, baseDir := range c.Config.Shares {
 		if isTargetShare(key, c.Config.TargetShares) {
@@ -216,6 +230,9 @@ func (c *Client) SyncAllShares() {
 			}
 
 			err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+				if cerr := ctx.Err(); cerr != nil {
+					return cerr // connection torn down — abort the scan
+				}
 				if err != nil {
 					slog.Debug("[Client] WalkDir error, skipping entry", "path", p, "err", err)
 					return nil
@@ -262,7 +279,11 @@ func (c *Client) SyncAllShares() {
 			}
 
 			if err != nil {
-				slog.Error("[Client] Walk error", "key", k, "err", err)
+				if ctx.Err() != nil {
+					slog.Debug("[Client] Share scan aborted (disconnect)", "key", k)
+				} else {
+					slog.Error("[Client] Walk error", "key", k, "err", err)
+				}
 			} else {
 				slog.Debug("[Client] Share scan complete", "key", k, "files", totalFiles)
 			}

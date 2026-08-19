@@ -119,6 +119,11 @@ func (s *Session) Close() {
 	slog.Debug("[Session] All workers stopped.")
 }
 
+// Context returns the session's lifetime context, cancelled by Close. Callers
+// running background work tied to this connection (e.g. share scans) should
+// abort when it is done.
+func (s *Session) Context() context.Context { return s.ctx }
+
 // --- Shared ---
 
 func (s *Session) safeSend(payload []byte) error {

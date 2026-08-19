@@ -18,6 +18,10 @@ const (
 	EnvCreditTimeoutSec       = "CREDIT_TIMEOUT_SEC"
 	EnvSingleUploadTimeoutSec = "SINGLE_UPLOAD_TIMEOUT_SEC"
 
+	EnvLivenessIdleTimeoutSec  = "LIVENESS_IDLE_TIMEOUT_SEC"
+	EnvLivenessPingIntervalSec = "LIVENESS_PING_INTERVAL_SEC"
+	EnvHandshakeTimeoutSec     = "HANDSHAKE_TIMEOUT_SEC"
+
 	EnvScanBatchSize          = "SCAN_BATCH_SIZE"
 	EnvUploadQueueSize        = "UPLOAD_QUEUE_SIZE"
 	EnvDebounceDurationMs     = "DEBOUNCE_DURATION_MS"

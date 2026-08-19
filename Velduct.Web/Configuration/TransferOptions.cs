@@ -95,6 +95,11 @@ public class WebSocketOptions
 {
     public int KeepAliveSeconds { get; set; } = 15;
 
+    // Reap a connection after this long with no inbound activity (dead-client
+    // detection). Clients keep it fresh with a periodic app-level heartbeat, so
+    // this should be a few times the client heartbeat interval. 0 disables reaping.
+    public int ClientTimeoutSeconds { get; set; } = 45;
+
     public int SendRetryDelayMs { get; set; } = 100;
 
     public int KestrelBufferOverhead { get; set; } = 4096;

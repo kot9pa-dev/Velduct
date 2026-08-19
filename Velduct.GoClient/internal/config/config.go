@@ -23,6 +23,10 @@ type Config struct {
 	CreditTimeoutSec       int `json:"credit_timeout_sec"`
 	SingleUploadTimeoutSec int `json:"single_upload_timeout_sec"`
 
+	LivenessIdleTimeoutSec  int `json:"liveness_idle_timeout_sec"`
+	LivenessPingIntervalSec int `json:"liveness_ping_interval_sec"`
+	HandshakeTimeoutSec     int `json:"handshake_timeout_sec"`
+
 	ScanBatchSize          int `json:"scan_batch_size"`
 	UploadQueueSize        int `json:"upload_queue_size"`
 	DebounceDurationMs     int `json:"debounce_duration_ms"`

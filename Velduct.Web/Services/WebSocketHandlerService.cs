@@ -23,9 +23,11 @@ public class WebSocketHandlerService : IFrameHandler
     private readonly DiskWorkerService _diskWorker;
     private readonly ConnectionManager _connectionManager;
     private readonly ServerArchiveSender _archiveSender;
+    private readonly ConnectionTracker _connectionTracker;
 
     private TransferSession _session;
     private SingleFileReceiver _fileReceiver;
+    private ConnectionTracker.Entry _connEntry;
 
     // Queue for reverse sync (file pull requests); ensures one TAR at a time without blocking ReadLoop
     private readonly Channel<List<FileMetadata>> _pullRequestChannel =
@@ -45,7 +47,8 @@ public class WebSocketHandlerService : IFrameHandler
         ArchiveProcessor archiveProcessor,
         DiskWorkerService diskWorker,
         ConnectionManager connectionManager,
-        ServerArchiveSender archiveSender)
+        ServerArchiveSender archiveSender,
+        ConnectionTracker connectionTracker)
     {
         _logger = logger;
         _sync = sync;
@@ -57,6 +60,7 @@ public class WebSocketHandlerService : IFrameHandler
         _diskWorker = diskWorker;
         _connectionManager = connectionManager;
         _archiveSender = archiveSender;
+        _connectionTracker = connectionTracker;
     }
 
     public async Task HandleAsync(WebSocket webSocket, CancellationToken ct)
@@ -71,6 +75,9 @@ public class WebSocketHandlerService : IFrameHandler
             Microsoft.Extensions.Options.Options.Create(_options));
 
         _connectionManager.RegisterClient(connection, _session);
+        _connEntry = _connectionTracker.Add(connection.Id,
+            abort: () => { try { connection.Socket.Abort(); } catch { /* already gone */ } },
+            sendHeartbeat: () => connection.EnqueueSend(Protocol.HeartbeatMessage, WebSocketMessageType.Binary, true));
 
         _logger.LogInformation("Client connected (id={Id}). Starting session (MaxCredits={Credits}, ChunkSize={Chunk}KB). Active clients: {Total}.",
             connection.Id, _options.Network.MaxCredits, _options.Network.ChunkSizeBytes / 1024, _connectionManager.ClientCount);
@@ -106,6 +113,7 @@ public class WebSocketHandlerService : IFrameHandler
 
     public Task OnCreditsAsync(int count, CancellationToken ct)
     {
+        _connEntry?.Touch();
         for (int i = 0; i < count; i++)
         {
             _session!.Connection.OutboundCredits.Writer.TryWrite(1);
@@ -117,12 +125,19 @@ public class WebSocketHandlerService : IFrameHandler
         => Task.FromResult(_archiveProcessor.HasActiveArchive(_session!));
 
     public Task OnArchiveChunkAsync(byte[] buffer, int written, CancellationToken ct)
-        => _archiveProcessor.FlushChunkAsync(_session!, buffer, written, ct);
+    {
+        _connEntry?.Touch(); // hot path: one atomic write, no lookup
+        return _archiveProcessor.FlushChunkAsync(_session!, buffer, written, ct);
+    }
 
     public async Task OnFullMessageAsync(byte opCode, byte[] payload, CancellationToken ct)
     {
+        _connEntry?.Touch();
         switch (opCode)
         {
+            case Protocol.CMD_HEARTBEAT:
+                break; // client liveness heartbeat; activity already recorded above
+
             case Protocol.CMD_CHECK_FILES:
                 await HandleCheckFilesAsync(_session!.Connection, payload, ct);
                 break;
@@ -515,7 +530,10 @@ public class WebSocketHandlerService : IFrameHandler
     private async Task CleanupSessionAsync()
     {
         if (_session != null)
+        {
             _connectionManager.UnregisterClient(_session.Connection.Id);
+            _connectionTracker.Remove(_session.Connection.Id);
+        }
 
         if (_fileReceiver != null)
             await _fileReceiver.CloseCurrentFileAsync();

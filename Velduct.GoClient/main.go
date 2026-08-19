@@ -58,28 +58,31 @@ func resolveConfigPath() string {
 
 func loadConfig() config.Config {
 	cfg := config.Config{
-		ServerURL:              "ws://127.0.0.1:5050/ws",
-		Shares:                 make(map[string]string),
-		ReconnectIntervalSec:   5,
-		MaxCredits:             12,
-		ChunkSizeBytes:         4194304,
-		ReadBufferSize:         65536,
-		WriteBufferOverhead:    4096,
-		CreditTimeoutSec:       60,
-		SingleUploadTimeoutSec: 30,
-		ScanBatchSize:          100,
-		UploadQueueSize:        500,
-		DebounceDurationMs:     2500,
-		StartupSyncDelayMs:     500,
-		BatchCoalescingMaxMs:   2500,
-		BatchCoalescingIdleMs:  250,
-		MaxCopyRetries:         10,
-		FileLockRetryDelayMs:   500,
-		WatcherEventBufferSize: 512,
-		PprofAddress:           "localhost:6060",
-		JwtIssuer:              "ddzs-client",
-		JwtAudience:            "VelductServer",
-		JwtTTLSeconds:          300,
+		ServerURL:               "ws://127.0.0.1:5050/ws",
+		Shares:                  make(map[string]string),
+		ReconnectIntervalSec:    5,
+		MaxCredits:              12,
+		ChunkSizeBytes:          4194304,
+		ReadBufferSize:          65536,
+		WriteBufferOverhead:     4096,
+		CreditTimeoutSec:        60,
+		SingleUploadTimeoutSec:  30,
+		LivenessIdleTimeoutSec:  45,
+		LivenessPingIntervalSec: 15,
+		HandshakeTimeoutSec:     15,
+		ScanBatchSize:           100,
+		UploadQueueSize:         500,
+		DebounceDurationMs:      2500,
+		StartupSyncDelayMs:      500,
+		BatchCoalescingMaxMs:    2500,
+		BatchCoalescingIdleMs:   250,
+		MaxCopyRetries:          10,
+		FileLockRetryDelayMs:    500,
+		WatcherEventBufferSize:  512,
+		PprofAddress:            "localhost:6060",
+		JwtIssuer:               "ddzs-client",
+		JwtAudience:             "VelductServer",
+		JwtTTLSeconds:           300,
 	}
 
 	configPath := resolveConfigPath()
@@ -95,28 +98,31 @@ func loadConfig() config.Config {
 		slog.Warn("Config file not found, using defaults + env vars", "path", configPath)
 	}
 
-	cfg.ServerURL              = envStr(constants.EnvServerURL, cfg.ServerURL)
-	cfg.ReconnectIntervalSec   = envInt(constants.EnvReconnectInterval, cfg.ReconnectIntervalSec)
-	cfg.MaxCredits             = envInt(constants.EnvMaxCredits, cfg.MaxCredits)
-	cfg.ChunkSizeBytes         = envInt(constants.EnvChunkSizeBytes, cfg.ChunkSizeBytes)
-	cfg.ReadBufferSize         = envInt(constants.EnvReadBufferSize, cfg.ReadBufferSize)
-	cfg.WriteBufferOverhead    = envInt(constants.EnvWriteBufferOverhead, cfg.WriteBufferOverhead)
-	cfg.CreditTimeoutSec       = envInt(constants.EnvCreditTimeoutSec, cfg.CreditTimeoutSec)
-	cfg.SingleUploadTimeoutSec = envInt(constants.EnvSingleUploadTimeoutSec, cfg.SingleUploadTimeoutSec)
-	cfg.ScanBatchSize          = envInt(constants.EnvScanBatchSize, cfg.ScanBatchSize)
-	cfg.UploadQueueSize        = envInt(constants.EnvUploadQueueSize, cfg.UploadQueueSize)
-	cfg.DebounceDurationMs     = envInt(constants.EnvDebounceDurationMs, cfg.DebounceDurationMs)
-	cfg.StartupSyncDelayMs     = envInt(constants.EnvStartupSyncDelayMs, cfg.StartupSyncDelayMs)
-	cfg.BatchCoalescingMaxMs   = envInt(constants.EnvBatchCoalescingMaxMs, cfg.BatchCoalescingMaxMs)
-	cfg.BatchCoalescingIdleMs  = envInt(constants.EnvBatchCoalescingIdleMs, cfg.BatchCoalescingIdleMs)
-	cfg.MaxCopyRetries         = envInt(constants.EnvMaxCopyRetries, cfg.MaxCopyRetries)
-	cfg.FileLockRetryDelayMs   = envInt(constants.EnvFileLockRetryDelayMs, cfg.FileLockRetryDelayMs)
-	cfg.WatcherEventBufferSize = envInt(constants.EnvWatcherEventBufferSize, cfg.WatcherEventBufferSize)
-	cfg.PprofAddress           = envStr(constants.EnvPprofAddress, cfg.PprofAddress)
-	cfg.JwtKey                 = envStr(constants.EnvJwtKey, cfg.JwtKey)
-	cfg.JwtIssuer              = envStr(constants.EnvJwtIssuer, cfg.JwtIssuer)
-	cfg.JwtAudience            = envStr(constants.EnvJwtAudience, cfg.JwtAudience)
-	cfg.JwtTTLSeconds          = envInt(constants.EnvJwtTTLSeconds, cfg.JwtTTLSeconds)
+	cfg.ServerURL               = envStr(constants.EnvServerURL, cfg.ServerURL)
+	cfg.ReconnectIntervalSec    = envInt(constants.EnvReconnectInterval, cfg.ReconnectIntervalSec)
+	cfg.MaxCredits              = envInt(constants.EnvMaxCredits, cfg.MaxCredits)
+	cfg.ChunkSizeBytes          = envInt(constants.EnvChunkSizeBytes, cfg.ChunkSizeBytes)
+	cfg.ReadBufferSize          = envInt(constants.EnvReadBufferSize, cfg.ReadBufferSize)
+	cfg.WriteBufferOverhead     = envInt(constants.EnvWriteBufferOverhead, cfg.WriteBufferOverhead)
+	cfg.CreditTimeoutSec        = envInt(constants.EnvCreditTimeoutSec, cfg.CreditTimeoutSec)
+	cfg.SingleUploadTimeoutSec  = envInt(constants.EnvSingleUploadTimeoutSec, cfg.SingleUploadTimeoutSec)
+	cfg.LivenessIdleTimeoutSec  = envInt(constants.EnvLivenessIdleTimeoutSec, cfg.LivenessIdleTimeoutSec)
+	cfg.LivenessPingIntervalSec = envInt(constants.EnvLivenessPingIntervalSec, cfg.LivenessPingIntervalSec)
+	cfg.HandshakeTimeoutSec     = envInt(constants.EnvHandshakeTimeoutSec, cfg.HandshakeTimeoutSec)
+	cfg.ScanBatchSize           = envInt(constants.EnvScanBatchSize, cfg.ScanBatchSize)
+	cfg.UploadQueueSize         = envInt(constants.EnvUploadQueueSize, cfg.UploadQueueSize)
+	cfg.DebounceDurationMs      = envInt(constants.EnvDebounceDurationMs, cfg.DebounceDurationMs)
+	cfg.StartupSyncDelayMs      = envInt(constants.EnvStartupSyncDelayMs, cfg.StartupSyncDelayMs)
+	cfg.BatchCoalescingMaxMs    = envInt(constants.EnvBatchCoalescingMaxMs, cfg.BatchCoalescingMaxMs)
+	cfg.BatchCoalescingIdleMs   = envInt(constants.EnvBatchCoalescingIdleMs, cfg.BatchCoalescingIdleMs)
+	cfg.MaxCopyRetries          = envInt(constants.EnvMaxCopyRetries, cfg.MaxCopyRetries)
+	cfg.FileLockRetryDelayMs    = envInt(constants.EnvFileLockRetryDelayMs, cfg.FileLockRetryDelayMs)
+	cfg.WatcherEventBufferSize  = envInt(constants.EnvWatcherEventBufferSize, cfg.WatcherEventBufferSize)
+	cfg.PprofAddress            = envStr(constants.EnvPprofAddress, cfg.PprofAddress)
+	cfg.JwtKey                  = envStr(constants.EnvJwtKey, cfg.JwtKey)
+	cfg.JwtIssuer               = envStr(constants.EnvJwtIssuer, cfg.JwtIssuer)
+	cfg.JwtAudience             = envStr(constants.EnvJwtAudience, cfg.JwtAudience)
+	cfg.JwtTTLSeconds           = envInt(constants.EnvJwtTTLSeconds, cfg.JwtTTLSeconds)
 
 	return cfg
 }
@@ -134,6 +140,11 @@ func validateConfig(cfg config.Config) {
 	if cfg.MaxCredits < 3 {
 		slog.Error("FATAL: max_credits must be >= 3 to avoid deadlock in TAR upload",
 			"current", cfg.MaxCredits)
+		os.Exit(1)
+	}
+	if cfg.LivenessIdleTimeoutSec > 0 && cfg.LivenessPingIntervalSec >= cfg.LivenessIdleTimeoutSec {
+		slog.Error("FATAL: liveness_ping_interval_sec must be < liveness_idle_timeout_sec",
+			"ping", cfg.LivenessPingIntervalSec, "idle", cfg.LivenessIdleTimeoutSec)
 		os.Exit(1)
 	}
 }
@@ -212,7 +223,7 @@ func main() {
 	transfer.EnsureTempDirs(cfg.TempDirs)
 	transfer.CleanupTempFiles(cfg.TempDirs, cfg.Shares)
 
-	cfg.FsPrecisionMs = fsinfo.DetectWorstPrecisionMs(cfg.Shares)
+	cfg.FsPrecisionMs           = fsinfo.DetectWorstPrecisionMs(cfg.Shares)
 	slog.Info("FS mtime precision", "worstCaseMs", cfg.FsPrecisionMs)
 
 	// Graceful shutdown on SIGTERM/SIGINT

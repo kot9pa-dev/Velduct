@@ -80,6 +80,8 @@ try
     builder.Services.AddHostedService(sp => sp.GetRequiredService<GlobalDeleteQueueService>());
     builder.Services.AddSingleton<GlobalBroadcastFlusherService>();
     builder.Services.AddHostedService(sp => sp.GetRequiredService<GlobalBroadcastFlusherService>());
+    builder.Services.AddSingleton<Velduct.Web.Infrastructure.ConnectionTracker>();
+    builder.Services.AddHostedService<ConnectionHealthMonitorService>();
 
     builder.Services.AddScoped<StorageManager>();
     builder.Services.AddScoped<SyncOrchestrator>();

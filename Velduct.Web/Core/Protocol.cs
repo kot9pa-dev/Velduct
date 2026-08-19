@@ -25,9 +25,12 @@ public static class Protocol
     public const byte CMD_ARCHIVE_DATA = 0x31;
     public const byte CMD_ARCHIVE_DONE = 0x32;
 
+    public const byte CMD_HEARTBEAT = 0x40;
+
     public static readonly byte[] CreditMessage = { SRV_PULL_STREAM };
     public static readonly byte[] ArchiveStartMessage = { CMD_ARCHIVE_RAW_START };
     public static readonly byte[] ArchiveDoneMessage = { CMD_ARCHIVE_DONE };
+    public static readonly byte[] HeartbeatMessage = { CMD_HEARTBEAT };
 
     public static byte[] BuildCreditMessage(int count)
     {

@@ -16,5 +16,7 @@ const (
 	CmdArchiveStart byte = 0x30
 	CmdArchiveData  byte = 0x31
 	CmdArchiveDone  byte = 0x32
+
+	CmdHeartbeat byte = 0x40
 )
 
